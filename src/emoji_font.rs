@@ -13,6 +13,7 @@ Please see LICENSE in the repository root for full details.
 
 use std::collections::HashSet;
 use std::num::NonZeroUsize;
+use std::sync::OnceLock;
 
 /// Resident emoji textures. Picker holds ~1800; this covers several pages
 /// before the oldest are dropped and re-decoded.
@@ -37,9 +38,7 @@ const FALLBACK_FONTS: &[&str] = &[
 const RENDER_PX: u32 = 72;
 
 pub struct EmojiFont {
-    /// System bitmap font for glyphs Twemoji lacks. Face borrows these bytes,
-    /// so it is rebuilt per lookup.
-    data: Option<Vec<u8>>,
+    data: OnceLock<Option<Vec<u8>>>,
     textures: lru::LruCache<(String, usize), egui::TextureHandle>,
     /// Known-missing glyphs, to avoid a lookup per frame.
     missing: HashSet<String>,
@@ -48,7 +47,7 @@ pub struct EmojiFont {
 impl EmojiFont {
     pub fn new() -> Self {
         Self {
-            data: read_first(FALLBACK_FONTS),
+            data: OnceLock::new(),
             textures: lru::LruCache::new(NonZeroUsize::new(CACHE_CAP).expect("cap is non-zero")),
             missing: HashSet::new(),
         }
@@ -107,13 +106,11 @@ impl EmojiFont {
     }
 
     fn decode(&self, emoji: &str) -> Option<egui::ColorImage> {
-        // Prefer the bundled Twemoji font.
         if let Some(img) = Self::decode_with(TWEMOJI, emoji) {
             return Some(img);
         }
-        // Then the system font, for emoji newer than the Twemoji build.
-        let data = self.data.as_ref()?;
-        Self::decode_with(data, emoji)
+        let data = self.data.get_or_init(|| read_first(FALLBACK_FONTS));
+        Self::decode_with(data.as_ref()?, emoji)
     }
 
     /// Render one emoji from one font, whichever colour format it uses.
@@ -309,9 +306,10 @@ impl<'f> ttf_parser::colr::Painter<'f> for ColrPainter<'_, 'f> {
 fn read_first(paths: &[&str]) -> Option<Vec<u8>> {
     for path in paths {
         let resolved = match path.strip_prefix("~/") {
-            Some(rest) => std::env::var("HOME")
-                .ok()
-                .map(|h| std::path::PathBuf::from(h).join(rest))?,
+            Some(rest) => match std::env::var("HOME") {
+                Ok(h) => std::path::PathBuf::from(h).join(rest),
+                Err(_) => continue,
+            },
             None => std::path::PathBuf::from(path),
         };
         if let Ok(bytes) = std::fs::read(&resolved) {

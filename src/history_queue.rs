@@ -82,6 +82,22 @@ impl HistoryQueue {
         }
     }
 
+    /// Rename a room id everywhere: a local DM stub becoming the real room.
+    pub fn retarget(&mut self, from: &str, to: &str) {
+        for id in self.pending.iter_mut().filter(|id| id.as_str() == from) {
+            *id = to.to_owned();
+        }
+        if self.active.remove(from) {
+            self.active.insert(to.to_owned());
+        }
+        if self.loaded.remove(from) {
+            self.loaded.insert(to.to_owned());
+        }
+        if self.failed.remove(from) {
+            self.failed.insert(to.to_owned());
+        }
+    }
+
     pub fn is_loaded(&self, room: &str) -> bool {
         self.loaded.contains(room)
     }
@@ -128,5 +144,17 @@ mod tests {
         queue.select("a");
         assert!(queue.next_batch(Some("a")).is_empty());
         assert!(queue.is_loaded("a"));
+    }
+
+    #[test]
+    fn dm_stub_becomes_the_real_room() {
+        let mut queue = HistoryQueue::new(["!real:hs".to_owned()]);
+        queue.select("dm:@bob:hs");
+        assert_eq!(queue.next_batch(Some("dm:@bob:hs")), ["dm:@bob:hs"]);
+        queue.retarget("dm:@bob:hs", "!dm:hs");
+        // The in-flight stub request now counts for the real room.
+        queue.complete("!dm:hs", true);
+        assert!(queue.is_loaded("!dm:hs"));
+        assert!(!queue.has_failed("dm:@bob:hs"));
     }
 }

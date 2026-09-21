@@ -44,42 +44,6 @@ impl PackStore {
         Self::default()
     }
 
-    /// Build `(plain, html)` for `:shortcode:` text. Plain keeps the fallback;
-    /// html inlines `<img data-mx-emoticon>` so pack-less rooms still render it.
-    pub fn proxied_bodies(&self, raw: &str) -> (String, Option<String>) {
-        let mut html = String::new();
-        let mut found = false;
-        let mut rest = raw;
-        while let Some(start) = rest.find(':') {
-            let (before, after_start) = rest.split_at(start);
-            html.push_str(&escape_html(before));
-            if let Some(end) = after_start[1..].find(':') {
-                let sc = &after_start[..end + 2];
-                if let Some(img) = self.resolve(sc) {
-                    found = true;
-                    let key = sc.trim_matches(':');
-                    html.push_str(&format!(
-                        "<img data-mx-emoticon src=\"{}\" alt=\"{key}\" title=\"{key}\" height=\"32\" />",
-                        img.mxc_url
-                    ));
-                } else {
-                    html.push_str(&escape_html(sc));
-                }
-                rest = &after_start[end + 2..];
-            } else {
-                html.push_str(&escape_html(after_start));
-                rest = "";
-                break;
-            }
-        }
-        html.push_str(&escape_html(rest));
-        if found {
-            (raw.to_owned(), Some(html))
-        } else {
-            (raw.to_owned(), None)
-        }
-    }
-
     pub fn upsert_pack(&mut self, pack: ImagePack) {
         if let Some(addr) = &pack.address {
             self.packs.retain(|p| p.address.as_ref() != Some(addr));
@@ -177,12 +141,6 @@ impl PackStore {
     }
 }
 
-fn escape_html(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -230,24 +188,5 @@ mod tests {
             }],
         });
         assert_eq!(store.resolve(":x:").unwrap().mxc_url, "mxc://a");
-    }
-
-    #[test]
-    fn proxies_foreign_shortcode_to_img_html() {
-        let mut store = PackStore::new();
-        store.upsert_pack(ImagePack {
-            address: None,
-            display_name: "a".into(),
-            images: vec![PackImage {
-                shortcode: "dance".into(),
-                mxc_url: "mxc://hs/aaa".into(),
-                is_sticker: false,
-            }],
-        });
-        let (plain, html) = store.proxied_bodies("hey :dance: yo");
-        assert_eq!(plain, "hey :dance: yo");
-        let html = html.expect("img html");
-        assert!(html.contains("mxc://hs/aaa"));
-        assert!(html.contains("data-mx-emoticon"));
     }
 }

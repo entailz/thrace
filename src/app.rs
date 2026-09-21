@@ -30,6 +30,21 @@ pub struct ImageAttachment {
     pub duration_ms: Option<u64>,
 }
 
+/// Audio attachment (`m.audio` via mxc): voice notes and music.
+#[derive(Debug, Clone)]
+pub struct AudioAttachment {
+    pub mxc: String,
+    pub source: matrix_sdk::ruma::events::room::MediaSource,
+    pub name: String,
+    pub mime: String,
+    /// Track length in ms, from `info` or MSC1767.
+    pub duration_ms: Option<u64>,
+    /// Bar heights 0..=1 from MSC1767, empty when the sender sent none.
+    pub waveform: Vec<f32>,
+    /// MSC3245 voice note: compact bubble rather than file row.
+    pub is_voice: bool,
+}
+
 /// Timeline row with reply/thread support.
 #[derive(Debug, Clone)]
 pub struct TimelineRow {
@@ -48,6 +63,7 @@ pub struct TimelineRow {
     pub reply_to_id: Option<String>,
     pub thread_count: usize,
     pub image: Option<ImageAttachment>,
+    pub audio: Option<AudioAttachment>,
     /// Grouped reactions: key + senders. Redaction names `Reactor.event_id`.
     pub reactions: Vec<Reaction>,
     pub is_sticker: bool,
@@ -64,6 +80,8 @@ pub struct TimelineRow {
 pub struct Reaction {
     pub key: String,
     pub senders: Vec<Reactor>,
+    /// Server-bundled total per key; covers reactions from before this session.
+    pub bundled: usize,
 }
 
 /// One person's reaction: who, and the event to redact to take it back.
@@ -76,7 +94,7 @@ pub struct Reactor {
 
 impl Reaction {
     pub fn count(&self) -> usize {
-        self.senders.len()
+        self.senders.len().max(self.bundled)
     }
     pub fn owns(&self, user: &str) -> bool {
         self.senders.iter().any(|s| s.user == user)
@@ -98,6 +116,13 @@ enum SendResult {
     Failed(String),
 }
 
+/// DM creation result (worker → UI): swap the local stub for the real room.
+#[derive(Debug)]
+enum DmResult {
+    Created { stub_id: String, room_id: String },
+    Failed(String),
+}
+
 /// App state.
 pub struct ThraceApp {
     theme: ThemeFile,
@@ -113,8 +138,9 @@ pub struct ThraceApp {
     history_tx: Option<std::sync::mpsc::Sender<InitialHistory>>,
     /// Scrollback token per room; missing means history start reached.
     back_tokens: std::collections::HashMap<String, String>,
-    /// Room fetching older messages; guards one request at a time.
-    paginating: Option<String>,
+    /// Rooms with a scrollback page in flight; one request per room, so a slow
+    /// page in one room cannot block scrolling back in another.
+    paginating: std::collections::HashSet<String>,
     /// Older pages arriving from the worker.
     page_rx: Option<std::sync::mpsc::Receiver<HistoryPage>>,
     page_tx: Option<std::sync::mpsc::Sender<HistoryPage>>,
@@ -179,6 +205,28 @@ pub struct ThraceApp {
     /// Downloaded video files arriving from the worker.
     video_rx: Option<std::sync::mpsc::Receiver<(String, Result<std::path::PathBuf, String>)>>,
     video_tx: Option<std::sync::mpsc::Sender<(String, Result<std::path::PathBuf, String>)>>,
+    /// Running audio playback: (event id, player). One track at a time.
+    audio: Option<(String, crate::audio::AudioPlayer)>,
+    /// Downloaded audio temp files by mxc; replay needs no second download.
+    audio_paths: std::collections::HashMap<String, std::path::PathBuf>,
+    /// Computed waveforms by event id, when the event sent none.
+    audio_waves: std::collections::HashMap<String, Vec<f32>>,
+    /// Resolved durations in seconds by event id, when the event reported none.
+    audio_lengths: std::collections::HashMap<String, f64>,
+    /// Per-event audio errors (missing ffplay, undecodable file).
+    audio_errors: std::collections::HashMap<String, String>,
+    /// Event ids with an audio download in flight.
+    audio_pending: std::collections::HashSet<String>,
+    /// Ready audio files arriving from the worker.
+    audio_rx: Option<std::sync::mpsc::Receiver<(String, Result<AudioReady, String>)>>,
+    audio_tx: Option<std::sync::mpsc::Sender<(String, Result<AudioReady, String>)>>,
+    /// Messages whose reaction senders were backfilled from relations.
+    relations_fetched: std::collections::HashSet<String>,
+    /// A relation batch is in flight; keeps scrolling from spawning one per frame.
+    relations_busy: bool,
+    /// Backfilled reaction senders arriving from the worker: (room, per-target results).
+    react_rx: Option<std::sync::mpsc::Receiver<(String, RelationResults)>>,
+    react_tx: Option<std::sync::mpsc::Sender<(String, RelationResults)>>,
     /// Sidebar room menu: (room id, anchor, frame it opened on).
     room_menu: Option<(String, egui::Pos2, u64)>,
     /// Rooms we have tagged as favourites, for the menu's toggle state.
@@ -189,14 +237,18 @@ pub struct ThraceApp {
     /// Pending outgoing sends (echoed locally, confirmed on Sent).
     send_rx: Option<std::sync::mpsc::Receiver<SendResult>>,
     send_tx: Option<std::sync::mpsc::Sender<SendResult>>,
+    /// DM room creation (worker → UI); drained every frame.
+    dm_rx: Option<std::sync::mpsc::Receiver<DmResult>>,
+    dm_tx: Option<std::sync::mpsc::Sender<DmResult>>,
     /// Live sync: fresh timeline events (worker → UI), drained every frame.
     sync_rx: Option<std::sync::mpsc::Receiver<SyncBatch>>,
     /// Live sync runs once per login; re-login spawns a fresh loop.
     sync_running: bool,
     /// Live-sync task; aborted on logout/re-login so loops never overlap.
     sync_task: Option<tokio::task::JoinHandle<()>>,
-    /// Last read receipt sent; stops re-sending per sync batch.
-    last_receipt: Option<String>,
+    /// Newest event each room's read receipt was sent for; stops re-sending it
+    /// every frame. Per room, or returning to a room would re-send it.
+    last_receipt: std::collections::HashMap<String, String>,
     /// Own mxid: mention detection, skip self unread badges.
     own_user: String,
     status: String,
@@ -278,8 +330,6 @@ struct SyncBatch {
     edits: Vec<(String, String, String, Option<String>)>,
     /// (room, redacted event) `m.room.redaction`s.
     redactions: Vec<(String, String)>,
-    /// True when at least one row landed in the currently viewed room.
-    had_current_rows: bool,
 }
 
 impl SyncBatch {
@@ -295,6 +345,14 @@ impl SyncBatch {
     }
 }
 
+/// Downloaded + measured audio file arriving from the worker.
+struct AudioReady {
+    mxc: String,
+    path: std::path::PathBuf,
+    duration_secs: f64,
+    waveform: Option<Vec<f32>>,
+}
+
 /// One `m.reaction`: target + key + sender.
 #[derive(Debug, Clone)]
 struct SyncReaction {
@@ -305,6 +363,10 @@ struct SyncReaction {
     /// Own event id; named by a later redaction.
     event_id: String,
 }
+
+/// Backfilled relations per message: target event id plus senders, or `None`
+/// when that message's request failed.
+type RelationResults = Vec<(String, Option<Vec<SyncReaction>>)>;
 
 /// Skin-tone modifiers, applied on insert.
 const SKIN_TONES: &[(&str, &str)] = &[
@@ -631,15 +693,29 @@ impl ThraceApp {
             video_file: None,
             video_rx: None,
             video_tx: None,
+            audio: None,
+            audio_paths: Default::default(),
+            audio_waves: Default::default(),
+            audio_lengths: Default::default(),
+            audio_errors: Default::default(),
+            audio_pending: Default::default(),
+            audio_rx: None,
+            audio_tx: None,
+            relations_fetched: Default::default(),
+            relations_busy: false,
+            react_rx: None,
+            react_tx: None,
             profile_target: None,
             room_menu: None,
             favourites: std::collections::HashSet::new(),
             send_rx: None,
             send_tx: None,
+            dm_rx: None,
+            dm_tx: None,
             sync_rx: None,
             sync_running: false,
             sync_task: None,
-            last_receipt: None,
+            last_receipt: Default::default(),
             own_user: String::new(),
             timelines: std::collections::HashMap::new(),
             history_queue: Default::default(),
@@ -647,7 +723,7 @@ impl ThraceApp {
             history_rx: None,
             history_tx: None,
             back_tokens: std::collections::HashMap::new(),
-            paginating: None,
+            paginating: Default::default(),
             page_rx: None,
             page_tx: None,
             pending_scroll_fix: None,
@@ -757,13 +833,7 @@ impl ThraceApp {
             .iter()
             .find(|m| m.mxid == mxid)
             .map(|m| m.display.clone())
-            .unwrap_or_else(|| {
-                mxid.trim_start_matches('@')
-                    .split(':')
-                    .next()
-                    .unwrap_or(mxid)
-                    .to_owned()
-            })
+            .unwrap_or_else(|| localpart(mxid))
     }
 
     /// One emoji at `size`: colour bitmap, else text glyph. Returns response for clicks.
@@ -863,6 +933,27 @@ impl ThraceApp {
     }
 
     /// Short text with colour emoji, for previews and banners.
+    fn reply_text_size(&self) -> f32 {
+        self.settings_font_size.clamp(10.0, 24.0)
+    }
+
+    fn reply_preview(&mut self, ui: &mut egui::Ui, text: &str) {
+        let size = self.reply_text_size();
+        ui.scope(|ui| {
+            let style = ui.style_mut();
+            style
+                .text_styles
+                .insert(egui::TextStyle::Body, egui::FontId::proportional(size));
+            style
+                .text_styles
+                .insert(egui::TextStyle::Monospace, egui::FontId::monospace(size));
+            style
+                .text_styles
+                .insert(egui::TextStyle::Small, egui::FontId::proportional(size));
+            self.render_body(ui, text, None);
+        });
+    }
+
     fn emoji_text(&mut self, ui: &mut egui::Ui, text: &str, size: f32, weak: bool) {
         let style = |rt: egui::RichText| if weak { rt.weak() } else { rt };
         // Wrapped so long text can't run past the window.
@@ -1803,14 +1894,16 @@ impl ThraceApp {
 
     /// Timeline image ≤320px wide; placeholder while downloading, error + retry.
     fn render_image(&mut self, ui: &mut egui::Ui, img: &ImageAttachment) {
+        let Some(source) = timeline_still_source(img) else {
+            // Video with no still of its own: straight to the poster.
+            self.render_video_poster(ui, img);
+            return;
+        };
         let cache_key = format!("thumbnail:{}", img.mxc);
-        if let Some(handle) = self.media.texture_for_source(
-            &cache_key,
-            img.thumbnail_source
-                .clone()
-                .unwrap_or_else(|| img.source.clone()),
-            Some((320, 320)),
-        ) {
+        if let Some(handle) = self
+            .media
+            .texture_for_source(&cache_key, source, Some((320, 320)))
+        {
             let size = handle.size_vec2();
             let w = size.x.min(320.0);
             let h = if size.x > 0.0 {
@@ -1832,26 +1925,7 @@ impl ThraceApp {
                 .on_hover_text(hint);
             if img.is_video {
                 // Play badge marks it as video, not a still.
-                let centre = resp.rect.center();
-                ui.painter()
-                    .circle_filled(centre, 22.0, egui::Color32::from_black_alpha(140));
-                ui.painter().text(
-                    centre,
-                    egui::Align2::CENTER_CENTER,
-                    "\u{25B6}",
-                    egui::FontId::proportional(22.0),
-                    egui::Color32::WHITE,
-                );
-                if let Some(ms) = img.duration_ms {
-                    let secs = ms / 1000;
-                    ui.painter().text(
-                        resp.rect.right_bottom() - egui::vec2(6.0, 6.0),
-                        egui::Align2::RIGHT_BOTTOM,
-                        format!("{}:{:02}", secs / 60, secs % 60),
-                        egui::FontId::proportional(11.0),
-                        egui::Color32::WHITE,
-                    );
-                }
+                Self::paint_play_badge(ui, resp.rect, img.duration_ms);
             }
             if resp.clicked() {
                 self.image_preview = Some(img.clone());
@@ -1860,6 +1934,11 @@ impl ThraceApp {
         }
         match self.media.status(&cache_key) {
             Some(entry) if entry.error().is_some() => {
+                // The clip itself may still play; only its still failed.
+                if img.is_video {
+                    self.render_video_poster(ui, img);
+                    return;
+                }
                 let e = entry.error().unwrap_or_default().to_owned();
                 ui.vertical(|ui| {
                     ui.horizontal(|ui| {
@@ -1901,6 +1980,206 @@ impl ThraceApp {
                     });
                 });
             }
+        }
+    }
+
+    /// Play badge and clip length, painted over a video's frame.
+    fn paint_play_badge(ui: &egui::Ui, rect: egui::Rect, duration_ms: Option<u64>) {
+        let centre = rect.center();
+        ui.painter()
+            .circle_filled(centre, 22.0, egui::Color32::from_black_alpha(140));
+        ui.painter().text(
+            centre,
+            egui::Align2::CENTER_CENTER,
+            "\u{25B6}",
+            egui::FontId::proportional(22.0),
+            egui::Color32::WHITE,
+        );
+        if let Some(ms) = duration_ms {
+            let secs = ms / 1000;
+            ui.painter().text(
+                rect.right_bottom() - egui::vec2(6.0, 6.0),
+                egui::Align2::RIGHT_BOTTOM,
+                format!("{}:{:02}", secs / 60, secs % 60),
+                egui::FontId::proportional(11.0),
+                egui::Color32::WHITE,
+            );
+        }
+    }
+
+    /// Stand-in for a video with no still: name, length and a play badge, clickable
+    /// into the player. Nothing is downloaded until the click.
+    fn render_video_poster(&mut self, ui: &mut egui::Ui, img: &ImageAttachment) {
+        let (rect, resp) = ui.allocate_exact_size(egui::vec2(220.0, 124.0), egui::Sense::click());
+        ui.painter()
+            .rect_filled(rect, 4.0, egui::Color32::from_gray(30));
+        Self::paint_play_badge(ui, rect, img.duration_ms);
+        ui.painter().text(
+            rect.left_bottom() + egui::vec2(6.0, -6.0),
+            egui::Align2::LEFT_BOTTOM,
+            truncate_name(&img.name, 24),
+            egui::FontId::proportional(11.0),
+            egui::Color32::from_gray(200),
+        );
+        if crate::ui::clickable(resp)
+            .on_hover_text("Play video")
+            .clicked()
+        {
+            self.image_preview = Some(img.clone());
+        }
+    }
+
+    /// Voice note / music row: round play button, seekable waveform, time.
+    fn render_audio(&mut self, ui: &mut egui::Ui, event_id: &str, audio: &AudioAttachment) {
+        if !audio.is_voice && !audio.name.trim().is_empty() {
+            ui.label(egui::RichText::new(&audio.name).small().weak());
+        }
+        if let Some(error) = self.audio_errors.get(event_id).cloned() {
+            let resp = crate::ui::clickable(
+                ui.label(egui::RichText::new(format!("Audio failed: {error} — retry")).small())
+                    .on_hover_text("Download and play again"),
+            );
+            if resp.clicked() {
+                self.audio_errors.remove(event_id);
+                self.fetch_audio(event_id, audio);
+            }
+            return;
+        }
+        let Some(path) = self.audio_paths.get(&audio.mxc).cloned() else {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(egui::RichText::new("Loading audio…").small().weak());
+            });
+            self.fetch_audio(event_id, audio);
+            return;
+        };
+        let duration = audio
+            .duration_ms
+            .map(|ms| ms as f64 / 1000.0)
+            .or_else(|| self.audio_lengths.get(event_id).copied())
+            .unwrap_or(0.0);
+        let bars: Vec<f32> = if audio.waveform.is_empty() {
+            self.audio_waves.get(event_id).cloned().unwrap_or_default()
+        } else {
+            audio.waveform.clone()
+        };
+        let now = ui.ctx().input(|i| i.time);
+        let active = self.audio.as_ref().is_some_and(|(id, _)| id == event_id);
+        let (position, paused, finished) = match self.audio.as_mut() {
+            Some((id, player)) if id == event_id => {
+                let position = player.position(now);
+                (position, player.is_paused(), player.finished)
+            }
+            _ => (0.0, true, false),
+        };
+        let mut toggle = false;
+        let mut seek_to: Option<f64> = None;
+        ui.horizontal(|ui| {
+            let (icon, tip) = if active && !paused && !finished {
+                ("\u{23F8}", "Pause")
+            } else {
+                ("\u{25B6}", "Play")
+            };
+            if ui
+                .add(egui::Button::new(egui::RichText::new(icon).size(15.0)))
+                .on_hover_text(tip)
+                .clicked()
+            {
+                toggle = true;
+            }
+            let width = (ui.available_width() - 64.0).max(80.0);
+            let (rect, _) =
+                ui.allocate_exact_size(egui::vec2(width, 36.0), egui::Sense::click_and_drag());
+            let painter = ui.painter_at(rect);
+            let played = self.theme.gold();
+            let unplayed = ui.visuals().weak_text_color().gamma_multiply(0.5);
+            let n = bars.len().max(1);
+            let progress = if duration > 0.0 {
+                (position / duration).clamp(0.0, 1.0) as f32
+            } else {
+                0.0
+            };
+            for (i, bar) in bars
+                .iter()
+                .chain(std::iter::repeat(&0.0))
+                .take(n)
+                .enumerate()
+            {
+                let h = (bar.clamp(0.0, 1.0) * 32.0).max(2.0);
+                let x0 = rect.left() + i as f32 * rect.width() / n as f32;
+                let bar_rect = egui::Rect::from_min_max(
+                    egui::pos2(x0 + 1.0, rect.center().y - h / 2.0),
+                    egui::pos2(
+                        x0 + rect.width() / n as f32 - 1.0,
+                        rect.center().y + h / 2.0,
+                    ),
+                );
+                painter.rect_filled(
+                    bar_rect,
+                    1.0,
+                    if (i as f32 / n as f32) < progress {
+                        played
+                    } else {
+                        unplayed
+                    },
+                );
+            }
+            let wave = ui.interact(
+                rect,
+                ui.id().with(("audio-seek", event_id)),
+                egui::Sense::click_and_drag(),
+            );
+            if duration > 0.0 && (wave.clicked() || wave.drag_stopped()) {
+                if let Some(pointer) = wave.interact_pointer_pos() {
+                    let fraction =
+                        ((pointer.x - rect.left()) / rect.width()).clamp(0.0, 1.0) as f64;
+                    seek_to = Some(fraction * duration);
+                }
+            }
+            let shown = if duration > 0.0 {
+                format!(
+                    "{} / {}",
+                    crate::audio::format_time(position),
+                    crate::audio::format_time(duration)
+                )
+            } else {
+                crate::audio::format_time(position)
+            };
+            ui.label(egui::RichText::new(shown).small().weak());
+        });
+        if toggle {
+            match self.audio.as_mut() {
+                Some((id, player)) if id == event_id => {
+                    if player.finished {
+                        player.seek(now, 0.0);
+                        if player.is_paused() {
+                            player.toggle_pause(now);
+                        }
+                    } else {
+                        player.toggle_pause(now);
+                    }
+                }
+                _ => match crate::audio::AudioPlayer::start(&path, now, 0.0, duration) {
+                    Ok(player) => self.audio = Some((event_id.to_owned(), player)),
+                    Err(e) => {
+                        self.audio_errors.insert(event_id.to_owned(), e);
+                    }
+                },
+            }
+        }
+        if let Some(target) = seek_to {
+            match self.audio.as_mut() {
+                Some((id, player)) if id == event_id => player.seek(now, target),
+                _ => match crate::audio::AudioPlayer::start(&path, now, target, duration) {
+                    Ok(player) => self.audio = Some((event_id.to_owned(), player)),
+                    Err(e) => {
+                        self.audio_errors.insert(event_id.to_owned(), e);
+                    }
+                },
+            }
+        }
+        if active && !paused {
+            ui.ctx().request_repaint();
         }
     }
 
@@ -2101,6 +2380,64 @@ impl ThraceApp {
                 Err(e) => Err(e),
             };
             let _ = tx.send((mxc, result));
+            ctx.request_repaint();
+        });
+    }
+
+    /// Download audio to a temp file so ffplay can read it, then measure what
+    /// the event did not report (duration, waveform).
+    fn fetch_audio(&mut self, event_id: &str, audio: &AudioAttachment) {
+        if self.audio_paths.contains_key(&audio.mxc)
+            || !self.audio_pending.insert(event_id.to_owned())
+        {
+            return;
+        }
+        let Some(client) = self.client.clone() else {
+            self.audio_pending.remove(event_id);
+            return;
+        };
+        if self.audio_tx.is_none() {
+            let (tx, rx) = std::sync::mpsc::channel();
+            self.audio_tx = Some(tx);
+            self.audio_rx = Some(rx);
+        }
+        let tx = self.audio_tx.clone().unwrap();
+        let ctx = self.ctx.clone();
+        let event_id = event_id.to_owned();
+        let source = audio.source.clone();
+        let mxc = audio.mxc.clone();
+        let name = audio.name.clone();
+        let duration_ms = audio.duration_ms;
+        let need_wave = audio.waveform.is_empty();
+        self.rt.spawn(async move {
+            let result = match crate::media_cache::fetch_mxc(&client, source).await {
+                Ok(bytes) => {
+                    let mut path = std::env::temp_dir();
+                    path.push(format!("thrace-audio-{}", sanitise(&name)));
+                    match std::fs::write(&path, &bytes) {
+                        Ok(()) => {
+                            let duration_secs = duration_ms
+                                .map(|ms| ms as f64 / 1000.0)
+                                .or_else(|| crate::audio::probe_duration(&path))
+                                .unwrap_or(0.0);
+                            let waveform = need_wave
+                                .then(|| {
+                                    crate::audio::compute_waveform(&path, crate::audio::WAVE_BARS)
+                                })
+                                .flatten();
+                            Ok(AudioReady {
+                                mxc,
+                                path,
+                                duration_secs,
+                                waveform,
+                            })
+                        }
+                        Err(e) => Err(format!("write: {e}")),
+                    }
+                }
+                Err(e) => Err(e),
+            };
+            let _ = tx.send((event_id, result));
             ctx.request_repaint();
         });
     }
@@ -2459,7 +2796,12 @@ impl ThraceApp {
         self.stop_history_loading();
         self.stop_emoji_saving();
         self.stop_media_worker();
-        self.last_receipt = None;
+        self.audio = None;
+        self.last_receipt.clear();
+        self.relations_fetched.clear();
+        self.relations_busy = false;
+        self.react_rx = None;
+        self.react_tx = None;
         self.own_user.clear();
         self.verify_watch_running = false;
         self.watch_rx = None;
@@ -2581,7 +2923,7 @@ impl ThraceApp {
         self.stop_live_sync();
         // Media worker holds the old client; restart it too.
         self.stop_media_worker();
-        self.last_receipt = None;
+        self.last_receipt.clear();
     }
 
     /// Cancel requests and discard old channels when changing accounts.
@@ -2594,7 +2936,7 @@ impl ThraceApp {
         self.history_tx = None;
         self.page_rx = None;
         self.page_tx = None;
-        self.paginating = None;
+        self.paginating.clear();
         self.pending_scroll_fix = None;
     }
 
@@ -2610,6 +2952,11 @@ impl ThraceApp {
         }
         let selected = self.current_room_id();
         for room_id in self.history_queue.next_batch(selected.as_deref()) {
+            // Local DM stub: no room on the server yet; `poll_dm` swaps in
+            // the real id and history loads then.
+            if room_id.starts_with("dm:") {
+                continue;
+            }
             if !self.rooms.iter().any(|room| room.room_id == room_id) {
                 self.history_queue.complete(&room_id, false);
                 continue;
@@ -2684,9 +3031,6 @@ impl ThraceApp {
             if let Some(latest) = latest {
                 self.refresh_preview(&room_id, &latest);
             }
-            if is_current {
-                self.send_current_read_receipt();
-            }
         }
     }
 
@@ -2744,6 +3088,124 @@ impl ThraceApp {
         self.sync_task = Some(task);
     }
 
+    /// Loaded messages still needing their reaction senders resolved, newest
+    /// first. Unresolved ones are picked *before* the cap applies — capping
+    /// first pinned the window to the newest screenful, which filled `fetched`
+    /// and then starved every older page behind it.
+    fn relation_targets(
+        rows: &[TimelineRow],
+        fetched: &std::collections::HashSet<String>,
+        limit: usize,
+    ) -> Vec<String> {
+        rows.iter()
+            .rev()
+            .filter(|r| r.sender != "system" && r.id.starts_with('$'))
+            .map(|r| r.id.as_str())
+            .filter(|id| !fetched.contains(*id))
+            .take(limit)
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// Backfill reaction senders for the messages this room has loaded, a burst
+    /// at a time. Called every frame, so a page resolves in full as soon as it
+    /// lands — the first page on open, an older page when scrollback brings it
+    /// in — without the reader having to scroll past each message. Failures go
+    /// back to unfetched, so the next frame retries them.
+    fn pump_relations(&mut self) {
+        if self.relations_busy {
+            return;
+        }
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        let Some(room_id) = self.current_room_id() else {
+            return;
+        };
+        let targets = Self::relation_targets(&self.rows, &self.relations_fetched, RELATION_BURST);
+        if targets.is_empty() {
+            return;
+        }
+        for id in &targets {
+            self.relations_fetched.insert(id.clone());
+        }
+        if self.react_tx.is_none() {
+            let (tx, rx) = std::sync::mpsc::channel();
+            self.react_tx = Some(tx);
+            self.react_rx = Some(rx);
+        }
+        let tx = self.react_tx.clone().unwrap();
+        let ctx = self.ctx.clone();
+        self.relations_busy = true;
+        self.rt.spawn(async move {
+            use matrix_sdk::ruma::OwnedRoomId;
+            let room = OwnedRoomId::try_from(room_id.clone())
+                .ok()
+                .and_then(|rid| client.get_room(&rid));
+            // Every target must come back with a verdict, or ids that went out
+            // stay marked fetched and their reactions never resolve.
+            let mut pending: std::collections::HashSet<String> = targets.iter().cloned().collect();
+            let mut done: RelationResults = Vec::with_capacity(targets.len());
+            if let Some(room) = room {
+                // One round trip per message, so run the burst together —
+                // sequentially a page of history takes seconds to fill in.
+                let mut set = tokio::task::JoinSet::new();
+                for target in targets {
+                    let (client, room) = (client.clone(), room.clone());
+                    set.spawn(async move {
+                        let reactions = fetch_message_reactions(&client, &room, &target).await;
+                        (target, reactions)
+                    });
+                }
+                while let Some(joined) = set.join_next().await {
+                    if let Ok((target, reactions)) = joined {
+                        pending.remove(&target);
+                        done.push((target, reactions));
+                    }
+                }
+            }
+            // Room gone, or a lookup that panicked and never reported: mark it
+            // failed so the id goes back to unfetched and the next frame retries.
+            done.extend(pending.into_iter().map(|target| (target, None)));
+            // Always report, even when every message came back bare: the reply is
+            // what clears `relations_busy`.
+            let _ = tx.send((room_id, done));
+            ctx.request_repaint();
+        });
+    }
+
+    /// Drain backfilled reaction senders into their rows and release the burst guard.
+    fn poll_relations(&mut self) {
+        let ready: Vec<(String, RelationResults)> = self
+            .react_rx
+            .as_ref()
+            .map(|rx| rx.try_iter().collect())
+            .unwrap_or_default();
+        if ready.is_empty() {
+            return;
+        }
+        self.relations_busy = false;
+        let mut failed = 0;
+        for (room_id, results) in ready {
+            for (target, result) in results {
+                match result {
+                    Some(reactions) => {
+                        for react in reactions {
+                            self.apply_sync_reaction(&room_id, react);
+                        }
+                    }
+                    None => {
+                        self.relations_fetched.remove(&target);
+                        failed += 1;
+                    }
+                }
+            }
+        }
+        if failed > 0 {
+            eprintln!("thrace: {failed} reaction backfill requests failed; will retry");
+        }
+    }
+
     /// Drain live-sync batches into rooms; bump unread for background rooms.
     fn poll_live_sync(&mut self) {
         loop {
@@ -2769,7 +3231,6 @@ impl ThraceApp {
             let mentions = mentions_user(&row, &own);
             let preview_row = (row.sender != "system").then(|| row.clone());
             let merged = if is_current {
-                batch.had_current_rows = true;
                 merge_row(std::rc::Rc::make_mut(&mut self.rows), row)
             } else {
                 // Echo reconciliation covers background rooms too.
@@ -2801,37 +3262,33 @@ impl ThraceApp {
                 self.status = "incoming verification — accept?".into();
             }
         }
-        // New rows in view: mark read.
-        if batch.had_current_rows {
-            self.send_current_read_receipt();
+    }
+
+    /// The timeline to mutate for `room_id`: the live rows when that room is on
+    /// screen, the stashed timeline otherwise. `None` for a room we hold nothing for.
+    fn timeline_for_mut(&mut self, room_id: &str) -> Option<&mut Vec<TimelineRow>> {
+        let current = self
+            .rooms
+            .get(self.current)
+            .is_some_and(|r| r.room_id == room_id);
+        if current {
+            Some(std::rc::Rc::make_mut(&mut self.rows))
+        } else {
+            self.timelines.get_mut(room_id)
         }
     }
 
     /// Rewrite a message in place from an `m.replace`.
     fn apply_edit(&mut self, room_id: &str, target: &str, body: String, formatted: Option<String>) {
-        let cur_id = self.rooms.get(self.current).map(|r| r.room_id.clone());
-        if cur_id.as_deref() == Some(room_id) {
-            edit_in(
-                std::rc::Rc::make_mut(&mut self.rows).as_mut_slice(),
-                target,
-                body,
-                formatted,
-            );
-        } else if let Some(tl) = self.timelines.get_mut(room_id) {
-            edit_in(tl, target, body, formatted);
+        if let Some(rows) = self.timeline_for_mut(room_id) {
+            edit_in(rows.as_mut_slice(), target, body, formatted);
         }
     }
 
     /// Apply one `m.room.redaction`: drop reaction or tombstone message.
     fn apply_redaction(&mut self, room_id: &str, redacted: &str) {
-        let cur_id = self.rooms.get(self.current).map(|r| r.room_id.clone());
-        if cur_id.as_deref() == Some(room_id) {
-            redact_in(
-                std::rc::Rc::make_mut(&mut self.rows).as_mut_slice(),
-                redacted,
-            );
-        } else if let Some(tl) = self.timelines.get_mut(room_id) {
-            redact_in(tl, redacted);
+        if let Some(rows) = self.timeline_for_mut(room_id) {
+            redact_in(rows.as_mut_slice(), redacted);
         }
     }
 
@@ -2855,50 +3312,40 @@ impl ThraceApp {
 
     /// Fold one wire reaction into its target; ignore unknown targets.
     fn apply_sync_reaction(&mut self, room_id: &str, react: SyncReaction) {
-        let cur_id = self.rooms.get(self.current).map(|r| r.room_id.clone());
-        if cur_id.as_deref() == Some(room_id) {
-            fold_reaction(std::rc::Rc::make_mut(&mut self.rows).as_mut_slice(), &react);
-        } else if let Some(tl) = self.timelines.get_mut(room_id) {
-            fold_reaction(tl, &react);
+        if let Some(rows) = self.timeline_for_mut(room_id) {
+            fold_reaction(rows.as_mut_slice(), &react);
         }
     }
 
     /// Fold one `m.read` receipt into its target; receipts move forward.
     fn apply_sync_receipt(&mut self, room_id: &str, event_id: &str, user_id: &str) {
-        let cur_id = self.rooms.get(self.current).map(|r| r.room_id.clone());
-        if cur_id.as_deref() == Some(room_id) {
-            seen_in(
-                std::rc::Rc::make_mut(&mut self.rows).as_mut_slice(),
-                event_id,
-                user_id,
-            );
-        } else if let Some(tl) = self.timelines.get_mut(room_id) {
-            seen_in(tl, event_id, user_id);
+        if let Some(rows) = self.timeline_for_mut(room_id) {
+            seen_in(rows.as_mut_slice(), event_id, user_id);
         }
     }
 
-    /// Send read receipt for the newest real row in view.
-    fn send_current_read_receipt(&mut self) {
+    /// Mark the newest message read, when the reader has actually reached it.
+    /// `newest_visible` is the last real row on screen this frame.
+    fn send_current_read_receipt(&mut self, newest_visible: Option<&str>) {
         let Some(client) = self.client.clone() else {
             return;
         };
         let Some(room_id) = self.current_room_id() else {
             return;
         };
-        let Some(target) = self
-            .rows
-            .iter()
-            .rev()
-            .find(|r| !r.id.starts_with("local-") && r.sender != "system" && r.id.starts_with('$'))
-            .map(|r| r.id.clone())
-        else {
+        // `None` means the backend does not report focus; assume focused rather
+        // than never sending a receipt there.
+        let focused = self.ctx.input(|i| i.viewport().focused).unwrap_or(true);
+        let Some(target) = receipt_target(
+            &self.rows,
+            newest_visible,
+            focused,
+            self.last_receipt.get(&room_id).map(String::as_str),
+        )
+        .map(str::to_owned) else {
             return;
         };
-        // One receipt per target event, not per batch.
-        if self.last_receipt.as_deref() == Some(target.as_str()) {
-            return;
-        }
-        self.last_receipt = Some(target.clone());
+        self.last_receipt.insert(room_id.clone(), target.clone());
         self.spawn_send(async move {
             use matrix_sdk::ruma::{OwnedEventId, OwnedRoomId};
             let Ok(room_id) = OwnedRoomId::try_from(room_id.clone()) else {
@@ -2932,14 +3379,24 @@ impl ThraceApp {
             Some(adjusted) => adjusted,
             None => return,
         };
-        // Stash outgoing timeline + members.
+        if idx == self.current {
+            // Already there: stashing below would round-trip the live rows
+            // through the cache and come back empty.
+            return;
+        }
+        // Stash outgoing timeline + members — unless we already arrived:
+        // dropping an empty DM stub points `current` at the target, and
+        // stashing then would overwrite its cache with empty rows.
+        let target = self.rooms.get(idx).map(|r| r.room_id.clone());
         if let Some(cur) = self.rooms.get(self.current).map(|r| r.room_id.clone()) {
-            self.timelines.insert(
-                cur.clone(),
-                std::mem::take(std::rc::Rc::make_mut(&mut self.rows)),
-            );
-            self.members_by_room
-                .insert(cur, std::mem::take(&mut self.members));
+            if Some(cur.as_str()) != target.as_deref() {
+                self.timelines.insert(
+                    cur.clone(),
+                    std::mem::take(std::rc::Rc::make_mut(&mut self.rows)),
+                );
+                self.members_by_room
+                    .insert(cur, std::mem::take(&mut self.members));
+            }
         }
         self.current = idx;
         let id = self.rooms[idx].room_id.clone();
@@ -2951,8 +3408,8 @@ impl ThraceApp {
         self.react_target = None;
         self.rooms[idx].unread = 0;
         self.rooms[idx].mentioned = false;
-        // Viewing marks read.
-        self.send_current_read_receipt();
+        // The wire receipt follows from the timeline once it renders at the
+        // bottom; clearing the badge here is only the local hint.
     }
 
     /// Drop unused DM stub; return `idx` adjusted (`None` if target vanished).
@@ -3045,49 +3502,113 @@ impl ThraceApp {
         });
     }
 
-    /// Click a user → open existing DM or stub a new one.
+    /// Index of the DM with `mxid`, if the sidebar already has one.
+    /// Matches by user id only: display names collide and nicknames change,
+    /// so neither may stand in for the mxid.
+    fn find_dm(&self, mxid: &str) -> Option<usize> {
+        let stub_id = format!("dm:{mxid}");
+        self.rooms.iter().enumerate().position(|(i, r)| {
+            if !r.is_dm {
+                return false;
+            }
+            if r.room_id == mxid || r.room_id == stub_id || r.name == mxid {
+                return true;
+            }
+            let members = if i == self.current {
+                Some(&self.members)
+            } else {
+                self.members_by_room.get(&r.room_id)
+            };
+            members.is_some_and(|ms| ms.iter().any(|m| m.mxid == mxid))
+        })
+    }
+
+    /// Click a user → open the existing DM or create one.
+    /// Matching is by mxid only: a nickname is not a user.
     fn open_dm(&mut self, mxid: &str, display: &str) {
-        if let Some(idx) = self
-            .rooms
-            .iter()
-            .position(|r| r.is_dm && (r.name == display || r.name == mxid || r.room_id == mxid))
-        {
+        let Ok(user_id) = matrix_sdk::ruma::OwnedUserId::try_from(mxid) else {
+            self.status = format!("bad user id: {mxid}");
+            return;
+        };
+        if let Some(idx) = self.find_dm(mxid) {
+            // A leftover stub never finished creating: switch to it and retry.
+            let is_stub = self
+                .rooms
+                .get(idx)
+                .is_some_and(|r| r.room_id.starts_with("dm:"));
             self.switch_room(idx);
+            if is_stub {
+                self.spawn_dm_creation(format!("dm:{mxid}"), user_id, display);
+            }
             return;
         }
-        // No DM room: stub locally so chat switches now.
-        // TODO: create_dm(mxid), replace stub with real room id.
+        // The SDK may know a DM room the sidebar hasn't listed yet.
+        if let Some(client) = self.client.clone() {
+            if let Some(room) = client.get_dm_room(&user_id) {
+                let id = room.room_id().to_string();
+                if let Some(idx) = self.rooms.iter().position(|r| r.room_id == id) {
+                    self.switch_room(idx);
+                } else {
+                    let avatar = self
+                        .members
+                        .iter()
+                        .chain(self.members_by_room.values().flatten())
+                        .find(|m| m.mxid == mxid)
+                        .and_then(|m| m.avatar_mxc.clone());
+                    self.switch_to_room_entry(
+                        RoomEntry {
+                            room_id: id,
+                            name: display.into(),
+                            unread: 0,
+                            mentioned: false,
+                            is_dm: true,
+                            avatar_mxc: avatar,
+                            preview: None,
+                        },
+                        vec![Member {
+                            display: display.into(),
+                            mxid: mxid.into(),
+                            online: true,
+                            avatar_mxc: None,
+                        }],
+                    );
+                }
+                return;
+            }
+        }
+        // No DM room: stub locally so chat switches now, then create the
+        // real room. `poll_dm` swaps the stub id for the real one.
         let stub_id = format!("dm:{mxid}");
-        self.timelines.insert(
-            self.rooms[self.current].room_id.clone(),
-            std::mem::take(std::rc::Rc::make_mut(&mut self.rows)),
+        // Search every loaded room; profile cards appear anywhere.
+        let avatar = self
+            .members
+            .iter()
+            .chain(self.members_by_room.values().flatten())
+            .find(|m| m.mxid == mxid)
+            .and_then(|m| m.avatar_mxc.clone());
+        self.switch_to_room_entry(
+            RoomEntry {
+                room_id: stub_id.clone(),
+                name: format!("@{display}"),
+                unread: 0,
+                mentioned: false,
+                is_dm: true,
+                avatar_mxc: avatar,
+                preview: None,
+            },
+            vec![Member {
+                display: display.into(),
+                mxid: mxid.into(),
+                online: true,
+                avatar_mxc: None,
+            }],
         );
-        self.members_by_room.insert(
-            self.rooms[self.current].room_id.clone(),
-            std::mem::take(&mut self.members),
-        );
-        self.rooms.push(RoomEntry {
-            room_id: stub_id.clone(),
-            name: format!("@{display}"),
-            unread: 0,
-            mentioned: false,
-            is_dm: true,
-            // Search every loaded room; profile cards appear anywhere.
-            avatar_mxc: self
-                .members
-                .iter()
-                .chain(self.members_by_room.values().flatten())
-                .find(|m| m.mxid == mxid)
-                .and_then(|m| m.avatar_mxc.clone()),
-            preview: None,
-        });
-        self.current = self.rooms.len() - 1;
-        self.rows = std::rc::Rc::new(vec![TimelineRow {
+        std::rc::Rc::make_mut(&mut self.rows).push(TimelineRow {
             id: "dm-new".into(),
             ts: format_ts(now_millis()),
             sender: "system".into(),
             display_name: "system".into(),
-            body: format!("Direct message with {display} ({mxid}) — say hi"),
+            body: format!("Direct message with {display} ({mxid}) — creating room…"),
             formatted: None,
             avatar_mxc: None,
             reply_to: None,
@@ -3096,16 +3617,103 @@ impl ThraceApp {
             edited: false,
             seen_by: Vec::new(),
             image: None,
+            audio: None,
             reactions: vec![],
             is_sticker: false,
             txn_id: None,
-        }]);
-        self.members = vec![Member {
-            display: display.into(),
-            mxid: mxid.into(),
-            online: true,
-            avatar_mxc: None,
-        }];
+        });
+        // Logged-out creation is refused inside; the stub still switches.
+        self.spawn_dm_creation(stub_id, user_id, display);
+    }
+
+    /// Ask the server for the real DM room; `poll_dm` swaps the stub id out.
+    fn spawn_dm_creation(
+        &mut self,
+        stub_id: String,
+        user_id: matrix_sdk::ruma::OwnedUserId,
+        display: &str,
+    ) {
+        let Some(client) = self.client.clone() else {
+            self.status = "log in to create the DM".into();
+            return;
+        };
+        if self.dm_tx.is_none() {
+            let (tx, rx) = std::sync::mpsc::channel();
+            self.dm_tx = Some(tx);
+            self.dm_rx = Some(rx);
+        }
+        let tx = self.dm_tx.clone().expect("just created");
+        let ctx = self.ctx.clone();
+        self.status = format!("creating DM with {display} …");
+        self.rt.spawn(async move {
+            let msg = match client.create_dm(&user_id).await {
+                Ok(room) => DmResult::Created {
+                    stub_id,
+                    room_id: room.room_id().to_string(),
+                },
+                Err(e) => DmResult::Failed(format!("create DM: {e}")),
+            };
+            let _ = tx.send(msg);
+            ctx.request_repaint();
+        });
+    }
+
+    /// Push a new sidebar entry and switch to it, stashing the old room.
+    fn switch_to_room_entry(&mut self, entry: RoomEntry, members: Vec<Member>) {
+        if let Some(cur) = self.rooms.get(self.current).map(|r| r.room_id.clone()) {
+            self.timelines.insert(
+                cur.clone(),
+                std::mem::take(std::rc::Rc::make_mut(&mut self.rows)),
+            );
+            self.members_by_room
+                .insert(cur, std::mem::take(&mut self.members));
+        }
+        self.rooms.push(entry);
+        self.current = self.rooms.len() - 1;
+        self.rows = std::rc::Rc::new(Vec::new());
+        self.members = members;
+        self.replying_to = None;
+        self.react_target = None;
+        self.history_queue
+            .select(self.rooms[self.current].room_id.as_str());
+        self.pump_history();
+    }
+
+    /// Drain finished DM creations: swap the stub id for the real room.
+    fn poll_dm(&mut self) {
+        let msg = match &self.dm_rx {
+            Some(rx) => rx.try_recv().ok(),
+            None => None,
+        };
+        let Some(msg) = msg else { return };
+        match msg {
+            DmResult::Created { stub_id, room_id } => {
+                // Move any stashed state from the stub key to the real one.
+                if let Some(rows) = self.timelines.remove(&stub_id) {
+                    self.timelines.insert(room_id.clone(), rows);
+                }
+                if let Some(members) = self.members_by_room.remove(&stub_id) {
+                    self.members_by_room.insert(room_id.clone(), members);
+                }
+                self.history_queue.retarget(&stub_id, &room_id);
+                if let Some(entry) = self.rooms.iter_mut().find(|r| r.room_id == stub_id) {
+                    entry.room_id = room_id.clone();
+                    entry.name = entry.name.trim_start_matches('@').to_owned();
+                }
+                // Retire the "creating room…" placeholder if still on screen.
+                for r in std::rc::Rc::make_mut(&mut self.rows)
+                    .iter_mut()
+                    .filter(|r| r.id == "dm-new")
+                {
+                    r.body = "Direct message — say hi".into();
+                }
+                self.status = "DM ready".into();
+                self.pump_history();
+            }
+            DmResult::Failed(e) => {
+                self.status = format!("send failed: {e}");
+            }
+        }
     }
 
     // Verification (SAS).
@@ -3161,12 +3769,11 @@ impl ThraceApp {
         };
         let dev: matrix_sdk::ruma::OwnedDeviceId = device_id.into();
         self.spawn_task(async move {
-            if let Err(e) = crate::verify::outgoing_verify_to_device(client, &user, &dev, tx).await
+            if let Err(e) =
+                crate::verify::outgoing_verify_to_device(client, &user, &dev, tx.clone()).await
             {
-                // Forward error explicitly.
-                let _ = std::sync::mpsc::channel::<crate::verify::VerifyEvent>()
-                    .0
-                    .send(crate::verify::VerifyEvent::Error(e));
+                // `tx` is the live one-shot channel; errors must surface in `poll_verify`.
+                let _ = tx.send(crate::verify::VerifyEvent::Error(e));
             }
         });
     }
@@ -3409,6 +4016,7 @@ impl ThraceApp {
                         edited: false,
                         seen_by: Vec::new(),
                         image: None,
+                        audio: None,
                         reactions: vec![],
                         is_sticker: false,
                         txn_id: None,
@@ -3430,6 +4038,7 @@ impl ThraceApp {
                         edited: false,
                         seen_by: Vec::new(),
                         image: None,
+                        audio: None,
                         reactions: vec![],
                         is_sticker: false,
                         txn_id: None,
@@ -3782,6 +4391,7 @@ impl ThraceApp {
             edited: false,
             seen_by: Vec::new(),
             image: None,
+            audio: None,
             reactions: vec![],
             is_sticker: false,
             txn_id: Some(txn.clone()),
@@ -4003,8 +4613,19 @@ impl ThraceApp {
 
     /// Plain message (or reply): local echo + `room.send` on a worker.
     fn send_text(&mut self, text: String) {
+        // The DM room doesn't exist server-side yet; queue nothing.
+        if self
+            .current_room_id()
+            .as_deref()
+            .is_some_and(|id| id.starts_with("dm:"))
+        {
+            self.status = "creating DM — send again in a moment".into();
+            return;
+        }
         let reply = self.replying_to.take().map(|id| ("you".into(), id));
-        let (plain, html) = self.packs.proxied_bodies(&text);
+        // Mentions + custom emoji in one pass; `m.mentions` is what notifies.
+        let (plain, html) = self.rich_bodies(&text);
+        let mentioned = self.mentioned_ids(&text);
         let formatted = html.clone();
         // Txn id on echo and send; sync echo replaces this row.
         let txn = format!("rs{}", Self::uuid_txn());
@@ -4051,6 +4672,9 @@ impl ThraceApp {
                     );
                 }
             }
+            // Always set: an empty `m.mentions` opts out of legacy push rules.
+            content =
+                content.add_mentions(matrix_sdk::ruma::events::Mentions::with_user_ids(mentioned));
             let txn_id: matrix_sdk::ruma::OwnedTransactionId = txn.clone().into();
             match room.send(content).with_transaction_id(txn_id).await {
                 Ok(_) => SendResult::Done("sent".into()),
@@ -4060,7 +4684,16 @@ impl ThraceApp {
     }
 
     fn send_emote(&mut self, text: String) {
-        let (plain, html) = self.packs.proxied_bodies(&text);
+        if self
+            .current_room_id()
+            .as_deref()
+            .is_some_and(|id| id.starts_with("dm:"))
+        {
+            self.status = "creating DM — send again in a moment".into();
+            return;
+        }
+        let (plain, html) = self.rich_bodies(&text);
+        let mentioned = self.mentioned_ids(&text);
         let txn = format!("rs{}", Self::uuid_txn());
         self.push_local(
             "* you",
@@ -4084,10 +4717,12 @@ impl ThraceApp {
                 return SendResult::Failed("room not found".into());
             };
             use matrix_sdk::ruma::events::room::message::RoomMessageEventContent;
-            let content = match html {
+            let mut content = match html {
                 Some(h) => RoomMessageEventContent::emote_html(plain, h),
                 None => RoomMessageEventContent::emote_plain(plain),
             };
+            content =
+                content.add_mentions(matrix_sdk::ruma::events::Mentions::with_user_ids(mentioned));
             let txn_id: matrix_sdk::ruma::OwnedTransactionId = txn.clone().into();
             match room.send(content).with_transaction_id(txn_id).await {
                 Ok(_) => SendResult::Done("sent".into()),
@@ -4249,6 +4884,7 @@ impl ThraceApp {
                 w: 0,
                 h: 0,
             }),
+            audio: None,
             reactions: vec![],
             is_sticker: true,
             txn_id: None,
@@ -4546,6 +5182,7 @@ impl ThraceApp {
             edited: false,
             seen_by: Vec::new(),
             image: None,
+            audio: None,
             reactions: vec![],
             is_sticker: false,
             txn_id,
@@ -4601,6 +5238,7 @@ impl ThraceApp {
                     user: own_user.to_owned(),
                     event_id: String::new(),
                 }],
+                bundled: 0,
             });
         }
     }
@@ -4633,6 +5271,56 @@ impl ThraceApp {
             format!("{cmd} {args}")
         };
         self.slash_selected = 0;
+    }
+
+    /// Stable id for the composer field, so accepting a completion can hand
+    /// focus straight back to it from anywhere in the frame.
+    fn composer_id() -> egui::Id {
+        egui::Id::new("composer")
+    }
+
+    fn focus_composer(ctx: &egui::Context) {
+        ctx.memory_mut(|m| m.request_focus(Self::composer_id()));
+    }
+
+    /// Members matching an @-mention prefix, for the composer dropdown.
+    fn mention_hits(&self, prefix: &str) -> Vec<Member> {
+        let q = prefix.trim_start_matches('@').to_lowercase();
+        self.members
+            .iter()
+            .filter(|m| {
+                q.is_empty()
+                    || m.display.to_lowercase().contains(&q)
+                    || m.mxid.to_lowercase().contains(&q)
+            })
+            .take(8)
+            .cloned()
+            .collect()
+    }
+
+    /// Accept a highlighted @-mention: swap the partial @word for the full
+    /// mxid and leave the composer open for the rest of the message.
+    /// The mxid (not the display name) is what notifies and pill-renders.
+    fn accept_mention(&mut self, m: &Member, prefix: &str) {
+        let cut = self.input.len().saturating_sub(prefix.len());
+        self.input.truncate(cut);
+        self.input.push_str(&m.mxid);
+        self.input.push(' ');
+        self.mention_selected = 0;
+    }
+
+    /// Members named by `text`: full mxids, plus `@display` spellings for
+    /// names typed by hand. Matched against the current room's members.
+    fn mentioned_ids(&self, text: &str) -> Vec<matrix_sdk::ruma::OwnedUserId> {
+        mentioned_ids_in(&self.members, text)
+    }
+
+    /// Build `(plain, html)` for the composer text, resolving custom-emoji
+    /// `:shortcode:` and @-mention pills in one pass. One pass matters:
+    /// mxids contain colons, so an emoji-only scan would split `@user:hs`
+    /// apart and swallow a following `:shortcode:`.
+    fn rich_bodies(&self, raw: &str) -> (String, Option<String>) {
+        rich_bodies_in(&self.members, &self.packs, raw)
     }
 
     /// Apply a sidebar room action.
@@ -4723,7 +5411,7 @@ impl ThraceApp {
         let Some(room_id) = self.current_room_id() else {
             return;
         };
-        if self.paginating.is_some() || !self.history_queue.is_loaded(&room_id) {
+        if self.paginating.contains(&room_id) || !self.history_queue.is_loaded(&room_id) {
             return;
         }
         let Some(token) = self.back_tokens.get(&room_id).cloned() else {
@@ -4746,7 +5434,12 @@ impl ThraceApp {
             .iter()
             .map(|m| (m.mxid.clone(), m.avatar_mxc.clone()))
             .collect();
-        self.paginating = Some(room_id.clone());
+        let names: std::collections::HashMap<String, String> = self
+            .members
+            .iter()
+            .map(|m| (m.mxid.clone(), m.display.clone()))
+            .collect();
+        self.paginating.insert(room_id.clone());
         self.rt.spawn(async move {
             use matrix_sdk::ruma::OwnedRoomId;
             let rows_and_token = match OwnedRoomId::try_from(room_id.clone())
@@ -4754,7 +5447,7 @@ impl ThraceApp {
                 .and_then(|rid| client.get_room(&rid))
             {
                 Some(room) => {
-                    load_room_history(&room, &avatars, Some(token), INITIAL_HISTORY).await
+                    load_room_history(&room, &avatars, &names, Some(token), INITIAL_HISTORY).await
                 }
                 None => Err("room not found".into()),
             };
@@ -4765,7 +5458,7 @@ impl ThraceApp {
 
     /// Prepend an arriving older page above the visible rows.
     fn apply_page(&mut self, room_id: String, mut page: Vec<TimelineRow>, token: Option<String>) {
-        self.paginating = None;
+        self.paginating.remove(&room_id);
         match token {
             Some(t) => {
                 self.back_tokens.insert(room_id.clone(), t);
@@ -4947,6 +5640,132 @@ fn count_shared_rooms(
 }
 
 /// Fold one wire reaction into its target row. Unknown target: not paged in yet.
+/// Server-bundled reaction counts from `unsigned.m.relations`, so chips survive
+/// a restart instead of waiting for a live reaction to arrive.
+fn bundled_annotations(event: &serde_json::Value) -> Vec<Reaction> {
+    let Some(chunk) = event
+        .get("unsigned")
+        .and_then(|u| u.get("m.relations"))
+        .and_then(|r| r.get("m.annotation"))
+        .and_then(|a| a.get("chunk"))
+        .and_then(|c| c.as_array())
+    else {
+        return Vec::new();
+    };
+    chunk
+        .iter()
+        .filter_map(|entry| {
+            let key = entry.get("key").and_then(|v| v.as_str())?;
+            let count = entry.get("count").and_then(|v| v.as_u64())? as usize;
+            (!key.is_empty() && count > 0).then(|| Reaction {
+                key: key.to_owned(),
+                senders: Vec::new(),
+                bundled: count,
+            })
+        })
+        .collect()
+}
+
+fn merge_reactions(target: &mut Vec<Reaction>, extra: &[Reaction]) {
+    for group in extra {
+        match target.iter_mut().find(|r| r.key == group.key) {
+            Some(existing) => {
+                existing.bundled = existing.bundled.max(group.bundled);
+                for sender in &group.senders {
+                    match existing.senders.iter_mut().find(|s| s.user == sender.user) {
+                        Some(known) => {
+                            if known.event_id.is_empty() {
+                                known.event_id = sender.event_id.clone();
+                            }
+                        }
+                        None => existing.senders.push(sender.clone()),
+                    }
+                }
+            }
+            None => target.push(group.clone()),
+        }
+    }
+}
+
+fn parse_relation(json: &serde_json::Value, target: &str) -> Option<SyncReaction> {
+    if json.get("type").and_then(|v| v.as_str()) != Some("m.reaction") {
+        return None;
+    }
+    let sender = json.get("sender")?.as_str()?.to_owned();
+    let event_id = json.get("event_id")?.as_str()?.to_owned();
+    let relates = json.get("content")?.get("m.relates_to")?;
+    if relates.get("event_id").and_then(|v| v.as_str()) != Some(target) {
+        return None;
+    }
+    let key = relates.get("key")?.as_str()?.to_owned();
+    if key.is_empty() {
+        return None;
+    }
+    Some(SyncReaction {
+        target: target.to_owned(),
+        key,
+        sender,
+        event_id,
+    })
+}
+
+/// Reaction senders the server aggregated before this session, so tooltips
+/// name names and redaction matches. Encrypted relations decrypt per event.
+async fn fetch_message_reactions(
+    client: &matrix_sdk::Client,
+    room: &matrix_sdk::Room,
+    target: &str,
+) -> Option<Vec<SyncReaction>> {
+    use matrix_sdk::ruma::{OwnedEventId, OwnedRoomId};
+    let (Ok(room_id), Ok(event_id)) = (
+        OwnedRoomId::try_from(room.room_id().as_str()),
+        OwnedEventId::try_from(target),
+    ) else {
+        // A malformed id is nothing to retry; report it resolved and empty.
+        return Some(Vec::new());
+    };
+    // Ask by relation type only. Filtering by event type misses encrypted rooms,
+    // where reactions travel as plain `m.reaction` rather than `m.room.encrypted`
+    // — and a server that does encrypt them sends the other kind. The loop below
+    // handles both, so let it decide rather than the query.
+    let mut request =
+        matrix_sdk::ruma::api::client::relations::get_relating_events_with_rel_type::v1::Request::new(
+            room_id,
+            event_id,
+            matrix_sdk::ruma::events::relation::RelationType::Annotation,
+        );
+    request.limit = matrix_sdk::ruma::UInt::new(RELATION_PAGE.into());
+    let Ok(response) = client.send(request).await else {
+        return None;
+    };
+    let mut out = Vec::new();
+    for raw in response.chunk {
+        let Ok(json) = serde_json::to_value(&raw) else {
+            continue;
+        };
+        if let Some(react) = parse_relation(&json, target) {
+            out.push(react);
+            continue;
+        }
+        if json.get("type").and_then(|v| v.as_str()) != Some("m.room.encrypted") {
+            continue;
+        }
+        let cast = raw.cast_ref_unchecked::<
+            matrix_sdk::ruma::events::room::encrypted::OriginalSyncRoomEncryptedEvent,
+        >();
+        let Ok(decrypted) = room.decrypt_event(cast, None).await else {
+            continue;
+        };
+        let Ok(json) = serde_json::to_value(decrypted.raw()) else {
+            continue;
+        };
+        if let Some(react) = parse_relation(&json, target) {
+            out.push(react);
+        }
+    }
+    Some(out)
+}
+
 fn fold_reaction(rows: &mut [TimelineRow], react: &SyncReaction) -> bool {
     let Some(row) = rows.iter_mut().find(|r| r.id == react.target) else {
         return false;
@@ -4966,6 +5785,7 @@ fn fold_reaction(rows: &mut [TimelineRow], react: &SyncReaction) -> bool {
                 user: react.sender.clone(),
                 event_id: react.event_id.clone(),
             }],
+            bundled: 0,
         }),
     }
     true
@@ -4985,6 +5805,61 @@ fn edit_in(
     row.formatted = formatted;
     row.edited = true;
     true
+}
+
+fn edit_replacement(content: &serde_json::Value) -> Option<(String, String, Option<String>)> {
+    let relates = content.get("m.relates_to")?;
+    if relates.get("rel_type").and_then(|v| v.as_str()) != Some("m.replace") {
+        return None;
+    }
+    let target = relates
+        .get("event_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_owned();
+    let new = content.get("m.new_content").cloned().unwrap_or_default();
+    let body = new
+        .get("body")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned)
+        .unwrap_or_else(|| {
+            content
+                .get("body")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .trim_start_matches("* ")
+                .to_owned()
+        });
+    let formatted = new
+        .get("formatted_body")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned);
+    Some((target, body, formatted))
+}
+
+/// The event our read receipt should point at, or `None` when nothing is owed:
+/// the newest message is off screen, the window is in the background, or that
+/// message already carries our receipt. A scrolled-up reader has not seen it,
+/// so arrival alone must never mark a message read.
+fn receipt_target<'a>(
+    rows: &'a [TimelineRow],
+    newest_visible: Option<&str>,
+    focused: bool,
+    last_sent: Option<&str>,
+) -> Option<&'a str> {
+    if !focused {
+        return None;
+    }
+    let newest = rows
+        .iter()
+        .rev()
+        .find(|r| r.sender != "system" && r.id.starts_with('$'))?;
+    // Identity, not a pixel threshold: the newest message itself must be the
+    // last one on screen.
+    if newest_visible != Some(newest.id.as_str()) {
+        return None;
+    }
+    (last_sent != Some(newest.id.as_str())).then_some(newest.id.as_str())
 }
 
 /// Move one person's read receipt onto `event_id`. Unknown target (they read
@@ -5023,6 +5898,7 @@ fn redact_in(rows: &mut [TimelineRow], redacted: &str) {
         row.body = DELETED_BODY.into();
         row.formatted = None;
         row.image = None;
+        row.audio = None;
         row.reactions.clear();
     }
 }
@@ -5054,9 +5930,7 @@ fn merge_row(rows: &mut Vec<TimelineRow>, mut row: TimelineRow) -> RowMerge {
         if new.seen_by.is_empty() {
             new.seen_by = old.seen_by.clone();
         }
-        if new.reactions.is_empty() {
-            new.reactions = old.reactions.clone();
-        }
+        merge_reactions(&mut new.reactions, &old.reactions);
         new.edited |= old.edited;
     }
     if let Some(txn) = row.txn_id.clone() {
@@ -5150,27 +6024,6 @@ fn encode_clipboard_png(img: &arboard::ImageData<'_>) -> Result<(String, Vec<u8>
     Ok((format!("pasted-{}.png", ThraceApp::uuid_txn()), png))
 }
 
-/// Label for a reaction key: unicode speaks for itself, mxc (MSC4027) gets
-/// the pack shortcode when known.
-fn reaction_label(key: &str, packs: &PackStore) -> String {
-    if !key.starts_with("mxc://") {
-        // Return the name, never the glyph, or the tooltip duplicates the chip image as text.
-        let name = crate::emoji::name_of(key);
-        return if name.is_empty() {
-            key.trim_matches(':').to_owned()
-        } else {
-            name.to_owned()
-        };
-    }
-    packs
-        .packs()
-        .iter()
-        .flat_map(|p| p.images.iter())
-        .find(|i| i.mxc_url == key)
-        .map(|i| format!(":{}:", i.shortcode))
-        .unwrap_or_else(|| "custom emoji".to_owned())
-}
-
 /// Timeline events a single `/sync` may carry per room. The initial sync is
 /// unbounded server-side and dominates first-paint cost.
 const SYNC_TIMELINE_LIMIT: u32 = 20;
@@ -5241,6 +6094,98 @@ fn mention_prefix(input: &str) -> Option<&str> {
         return None;
     }
     Some(word)
+}
+
+/// Length of the `:shortcode:` at the start of `s`, if it is well-formed.
+/// Bounded so a stray colon in prose (or an mxid) is plain text, not emoji.
+fn shortcode_end(s: &str) -> Option<usize> {
+    if !s.starts_with(':') {
+        return None;
+    }
+    let end = s[1..].find(':')? + 1;
+    // `:a:` .. `:32-char-shortcode:`; inner text has no spaces or markup.
+    if !(2..=34).contains(&end) {
+        return None;
+    }
+    let inner = &s[1..end];
+    if inner
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '_' || c == '-' || c == '+')
+    {
+        Some(end + 1)
+    } else {
+        None
+    }
+}
+
+/// Free core of `ThraceApp::mentioned_ids`, so tests need no app instance.
+fn mentioned_ids_in(members: &[Member], text: &str) -> Vec<matrix_sdk::ruma::OwnedUserId> {
+    let mut ids = Vec::new();
+    for m in members {
+        let named = text.contains(m.mxid.as_str()) || text.contains(&format!("@{}", m.display));
+        if !named {
+            continue;
+        }
+        if let Ok(id) = matrix_sdk::ruma::OwnedUserId::try_from(m.mxid.clone()) {
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+    }
+    ids
+}
+
+/// Free core of `ThraceApp::rich_bodies`, so tests need no app instance.
+fn rich_bodies_in(members: &[Member], packs: &PackStore, raw: &str) -> (String, Option<String>) {
+    let mut html = String::new();
+    let mut rich = false;
+    let mut rest = raw;
+    while !rest.is_empty() {
+        // Longest member mxid first, so overlapping ids can't half-match.
+        if let Some(m) = members
+            .iter()
+            .filter(|m| rest.starts_with(m.mxid.as_str()))
+            .max_by_key(|m| m.mxid.len())
+        {
+            rich = true;
+            html.push_str(&format!(
+                "<a href=\"https://matrix.to/#/{}\">{}</a>",
+                m.mxid,
+                html_escape(&m.display)
+            ));
+            rest = &rest[m.mxid.len()..];
+            continue;
+        }
+        if let Some(end) = shortcode_end(rest) {
+            let sc = &rest[..end];
+            if let Some(img) = packs.resolve(sc) {
+                rich = true;
+                let key = sc.trim_matches(':');
+                html.push_str(&format!(
+                    "<img data-mx-emoticon src=\"{}\" alt=\"{key}\" title=\"{key}\" height=\"32\" />",
+                    img.mxc_url
+                ));
+            } else {
+                html.push_str(&html_escape(sc));
+            }
+            rest = &rest[end..];
+            continue;
+        }
+        let ch = rest.chars().next().expect("non-empty");
+        // Escape the char; per-char `replace` would re-scan.
+        match ch {
+            '&' => html.push_str("&amp;"),
+            '<' => html.push_str("&lt;"),
+            '>' => html.push_str("&gt;"),
+            _ => html.push(ch),
+        }
+        rest = &rest[ch.len_utf8()..];
+    }
+    if rich {
+        (raw.to_owned(), Some(html))
+    } else {
+        (raw.to_owned(), None)
+    }
 }
 
 /// Escape text for inclusion in `formatted_body`.
@@ -5367,7 +6312,7 @@ impl eframe::App for ThraceApp {
             match result {
                 Ok((rows, token)) => self.apply_page(room_id, rows, token),
                 Err(error) => {
-                    self.paginating = None;
+                    self.paginating.remove(&room_id);
                     self.status = error;
                 }
             }
@@ -5384,11 +6329,39 @@ impl eframe::App for ThraceApp {
                 }
             }
         }
+        // Ready audio files for ffplay.
+        let ready: Vec<_> = self
+            .audio_rx
+            .as_ref()
+            .map(|rx| rx.try_iter().collect())
+            .unwrap_or_default();
+        for (event_id, result) in ready {
+            self.audio_pending.remove(&event_id);
+            match result {
+                Ok(ready) => {
+                    self.audio_errors.remove(&event_id);
+                    self.audio_paths.insert(ready.mxc.clone(), ready.path);
+                    if ready.duration_secs > 0.0 {
+                        self.audio_lengths
+                            .insert(event_id.clone(), ready.duration_secs);
+                    }
+                    if let Some(wave) = ready.waveform {
+                        self.audio_waves.insert(event_id, wave);
+                    }
+                }
+                Err(e) => {
+                    self.audio_errors.insert(event_id, e);
+                }
+            }
+        }
         self.poll_login(ui.ctx());
         self.poll_verify();
         self.poll_send();
+        self.poll_dm();
         self.poll_media(ui.ctx());
         self.poll_live_sync();
+        self.poll_relations();
+        self.pump_relations();
         self.poll_history();
         self.pump_history();
         // Incoming verification sync; starts once per login.
@@ -5519,6 +6492,15 @@ impl eframe::App for ThraceApp {
                             .weak(),
                     );
                 }
+                // DM peer for one-tap verification, like Element/Cinny's DM shield.
+                let dm_peer: Option<String> = if is_dm {
+                    self.members
+                        .iter()
+                        .find(|m| m.mxid != self.own_user)
+                        .map(|m| m.mxid.clone())
+                } else {
+                    None
+                };
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     // No fake window buttons; the WM draws the real ones.
                     if crate::ui::icon_toggle(ui, icons::COG, "Settings", self.show_settings)
@@ -5543,6 +6525,17 @@ impl eframe::App for ThraceApp {
                     {
                         self.show_security = !self.show_security;
                         if self.show_security {
+                            self.refresh_devices();
+                        }
+                    }
+                    // DM shield: verify this conversation's peer without
+                    // hunting their profile card or typing an mxid.
+                    if let Some(peer) = dm_peer {
+                        if crate::ui::icon_button(ui, icons::VERIFIED, &format!("Verify {peer}"))
+                            .clicked()
+                        {
+                            self.verify_user_input = peer;
+                            self.show_security = true;
                             self.refresh_devices();
                         }
                     }
@@ -6065,6 +7058,7 @@ impl eframe::App for ThraceApp {
                     .map(|r| (r.display_name.clone(), snippet(&r.body, 48)))
                     .unwrap_or_else(|| ("a message".into(), String::new()));
                 let accent = self.theme.gold();
+                let reply_size = self.reply_text_size();
                 egui::Frame::new()
                     // Same ground as the timeline; not a raised surface.
                     .fill(ui.visuals().panel_fill)
@@ -6077,10 +7071,10 @@ impl eframe::App for ThraceApp {
                                 ui.allocate_exact_size(egui::vec2(2.0, 15.0), egui::Sense::hover());
                             ui.painter()
                                 .rect_filled(bar, egui::CornerRadius::same(1), accent);
-                            ui.label(egui::RichText::new("Replying to").small().weak());
-                            ui.label(egui::RichText::new(&who).small().strong());
+                            ui.label(egui::RichText::new("Replying to").size(reply_size).weak());
+                            ui.label(egui::RichText::new(&who).size(reply_size).strong());
                             if !quote.trim().is_empty() {
-                                self.emoji_text(ui, &quote, 11.0, true);
+                                self.reply_preview(ui, &quote);
                             }
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
@@ -6218,11 +7212,44 @@ impl eframe::App for ThraceApp {
                 };
                 let resp = ui.add(
                     egui::TextEdit::singleline(&mut self.input)
+                        .id(Self::composer_id())
                         .hint_text(hint)
                         .desired_width((ui.available_width() - trailing).max(120.0))
                         .margin(egui::Margin::symmetric(10, 7)),
                 );
-                if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                // Snapshot the @-mention state first: while the dropdown is
+                // open Enter/Tab accept the highlight and hand focus back,
+                // they never send a bare "@user" with an empty message.
+                let mention_state: Option<(String, Vec<Member>)> = mention_prefix(&self.input)
+                    .map(str::to_owned)
+                    .map(|prefix| {
+                        let hits = self.mention_hits(&prefix);
+                        (prefix, hits)
+                    });
+                let mention_open = mention_state
+                    .as_ref()
+                    .is_some_and(|(_, hits)| !hits.is_empty());
+                let enter_pressed =
+                    resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                // Gated on composer focus: Tab belongs to other fields when
+                // they hold it.
+                let tab_pressed = resp.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Tab));
+                if mention_open {
+                    let (prefix, hits) = mention_state.expect("open means state");
+                    self.mention_selected %= hits.len();
+                    if ui.input(|i| i.key_pressed(egui::Key::ArrowDown)) {
+                        self.mention_selected = (self.mention_selected + 1) % hits.len();
+                    }
+                    if ui.input(|i| i.key_pressed(egui::Key::ArrowUp)) {
+                        self.mention_selected =
+                            (self.mention_selected + hits.len() - 1) % hits.len();
+                    }
+                    if enter_pressed || tab_pressed {
+                        let m = hits[self.mention_selected % hits.len()].clone();
+                        self.accept_mention(&m, &prefix);
+                        Self::focus_composer(ui.ctx());
+                    }
+                } else if enter_pressed {
                     // A partial command completes; an exact verb runs straight away.
                     match self.slash_matches() {
                         Some((verb, matches)) if !matches.iter().any(|(c, _)| c[1..] == verb) => {
@@ -6232,6 +7259,14 @@ impl eframe::App for ThraceApp {
                             resp.request_focus();
                         }
                         _ => self.send_current_input(),
+                    }
+                } else if tab_pressed {
+                    // Tab completes a slash highlight without running it.
+                    if let Some((_, matches)) = self.slash_matches() {
+                        let selected = self.slash_selected % matches.len();
+                        let cmd = matches[selected].0;
+                        self.complete_slash(cmd);
+                        resp.request_focus();
                     }
                 }
 
@@ -6266,36 +7301,20 @@ impl eframe::App for ThraceApp {
                 }
             });
             // @-mention autocomplete: word under the cursor starting with '@'.
+            // Keys are handled beside the composer above (it owns `resp`);
+            // this block only draws the list and takes clicks.
             if let Some(prefix) = mention_prefix(&self.input).map(str::to_owned) {
                 // Owned: the `self.input` borrow would span the mutable uses below.
-                let q = prefix.trim_start_matches('@').to_lowercase();
-                let hits: Vec<Member> = self
-                    .members
-                    .iter()
-                    .filter(|m| {
-                        q.is_empty()
-                            || m.display.to_lowercase().contains(&q)
-                            || m.mxid.to_lowercase().contains(&q)
-                    })
-                    .take(8)
-                    .cloned()
-                    .collect();
+                let hits: Vec<Member> = self.mention_hits(&prefix);
                 if !hits.is_empty() {
                     self.mention_selected %= hits.len();
-                    let step = ui.input(|i| {
-                        i.key_pressed(egui::Key::ArrowDown) as usize
-                            + i.key_pressed(egui::Key::Tab) as usize
-                    });
-                    if step > 0 {
-                        self.mention_selected = (self.mention_selected + 1) % hits.len();
-                    }
-                    if ui.input(|i| i.key_pressed(egui::Key::ArrowUp)) {
-                        self.mention_selected =
-                            (self.mention_selected + hits.len() - 1) % hits.len();
-                    }
-                    let accept = ui.input(|i| i.key_pressed(egui::Key::Enter));
                     let mut chosen: Option<Member> = None;
                     egui::Frame::group(ui.style()).show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new("Enter or Tab to mention")
+                                .small()
+                                .weak(),
+                        );
                         for (i, m) in hits.iter().enumerate() {
                             let sel = i == self.mention_selected;
                             let row = ui.horizontal(|ui| {
@@ -6320,34 +7339,25 @@ impl eframe::App for ThraceApp {
                             if whole_row.clicked() {
                                 chosen = Some(m.clone());
                             }
-                            if sel && accept {
-                                chosen = Some(m.clone());
-                            }
                         }
                     });
                     if let Some(m) = chosen {
-                        // Replace the partial @word with the display name.
-                        let cut = self.input.len() - prefix.len();
-                        self.input.truncate(cut);
-                        self.input.push_str(&m.display);
-                        self.input.push(' ');
-                        self.mention_selected = 0;
+                        // Full mxid, not the display name: that is what
+                        // notifies the user and renders as a pill.
+                        self.accept_mention(&m, &prefix);
+                        Self::focus_composer(ui.ctx());
                     }
                 }
             }
             if let Some((_, matches)) = self.slash_matches() {
                 let selected = self.slash_selected % matches.len();
-                // Tab completes the highlight; arrows move it.
-                if ui.input(|i| i.key_pressed(egui::Key::Tab)) {
-                    let cmd = matches[selected].0;
-                    self.complete_slash(cmd);
-                } else {
-                    if ui.input(|i| i.key_pressed(egui::Key::ArrowDown)) {
-                        self.slash_selected = (selected + 1) % matches.len();
-                    }
-                    if ui.input(|i| i.key_pressed(egui::Key::ArrowUp)) {
-                        self.slash_selected = (selected + matches.len() - 1) % matches.len();
-                    }
+                // Tab is completed beside the composer (it owns `resp`);
+                // arrows only move the highlight here.
+                if ui.input(|i| i.key_pressed(egui::Key::ArrowDown)) {
+                    self.slash_selected = (selected + 1) % matches.len();
+                }
+                if ui.input(|i| i.key_pressed(egui::Key::ArrowUp)) {
+                    self.slash_selected = (selected + matches.len() - 1) % matches.len();
                 }
                 let mut chosen: Option<&str> = None;
                 egui::Frame::group(ui.style()).show(ui, |ui| {
@@ -6368,6 +7378,7 @@ impl eframe::App for ThraceApp {
                 });
                 if let Some(cmd) = chosen {
                     self.complete_slash(cmd);
+                    Self::focus_composer(ui.ctx());
                 }
             }
         });
@@ -6413,8 +7424,11 @@ impl eframe::App for ThraceApp {
                     // Fill the panel; a shrunk scroll area clips rows and strands the scrollbar.
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        // Scrollback indicator at the very top.
-                        if self.paginating.is_some() {
+                        // Scrollback indicator at the very top, for this room only.
+                        if self
+                            .current_room_id()
+                            .is_some_and(|id| self.paginating.contains(&id))
+                        {
                             ui.horizontal(|ui| {
                                 ui.spinner();
                                 ui.label(
@@ -6433,6 +7447,9 @@ impl eframe::App for ThraceApp {
                         let mut react_open: Option<(String, egui::Pos2)> = None;
                         let mut profile_open: Option<(String, egui::Pos2)> = None;
                         let mut jump_to: Option<String> = None;
+                        // Real events on screen this frame, in timeline order. Drives
+                        // reaction backfill and the read receipt.
+                        let mut visible: Vec<String> = Vec::new();
                         // Consumed by whichever row matches it this frame.
                         let scroll_target = self.scroll_to_event.take();
                         let now = ui.ctx().input(|i| i.time);
@@ -6548,8 +7565,9 @@ impl eframe::App for ThraceApp {
                                             if let Some((who, snip, avatar)) = reply_view.clone() {
                                                 // Accent bar + "In reply to" + avatar + name.
                                                 let colour = self.nick_color(&who);
+                                                let reply_size = self.reply_text_size();
                                                 let line = ui.horizontal(|ui| {
-                                                    ui.spacing_mut().item_spacing.x = 5.0;
+                                                    ui.spacing_mut().item_spacing.x = 4.0;
                                                     let (bar, _) = ui.allocate_exact_size(
                                                         egui::vec2(2.0, 15.0),
                                                         egui::Sense::hover(),
@@ -6561,7 +7579,7 @@ impl eframe::App for ThraceApp {
                                                     );
                                                     ui.label(
                                                         egui::RichText::new("In reply to")
-                                                            .small()
+                                                            .size(reply_size)
                                                             .weak(),
                                                     );
                                                     let (av, _) = ui.allocate_exact_size(
@@ -6574,13 +7592,13 @@ impl eframe::App for ThraceApp {
                                                     );
                                                     ui.label(
                                                         egui::RichText::new(&who)
-                                                            .small()
+                                                            .size(reply_size)
                                                             .color(colour)
                                                             .strong(),
                                                     );
                                                     if !snip.trim().is_empty() {
                                                         let text = snippet(&snip, 70);
-                                                        self.emoji_text(ui, &text, 11.0, true);
+                                                        self.reply_preview(ui, &text);
                                                     }
                                                 });
                                                 // Hover-only labels inside, so this steals no clicks.
@@ -6621,6 +7639,8 @@ impl eframe::App for ThraceApp {
                                                         );
                                                     }
                                                 }
+                                            } else if let Some(audio) = row.audio.clone() {
+                                                self.render_audio(ui, &row_id, &audio);
                                             } else {
                                                 let b = row.body.clone();
                                                 let f = row.formatted.clone();
@@ -6679,7 +7699,18 @@ impl eframe::App for ThraceApp {
                                                                 )
                                                             });
                                                         // Owned state rides on the chip fill/outline, not extra glyphs.
+                                                        // A plain frame, not a Button: buttons restyle on
+                                                        // hover, which resized the chip and nudged the
+                                                        // timeline up/down. This frame is identical
+                                                        // hovered or not, so rows never shift.
                                                         let accent = self.theme.gold();
+                                                        // The old light squircle becomes the 1px
+                                                        // border; the fill goes darker behind it.
+                                                        let light = ui
+                                                            .visuals()
+                                                            .widgets
+                                                            .hovered
+                                                            .bg_fill;
                                                         let (fill, stroke) = if owned {
                                                             (
                                                                 accent.gamma_multiply(0.22),
@@ -6689,53 +7720,74 @@ impl eframe::App for ThraceApp {
                                                             (
                                                                 ui.visuals()
                                                                     .widgets
-                                                                    .hovered
-                                                                    .bg_fill,
-                                                                egui::Stroke::NONE,
+                                                                    .inactive
+                                                                    .bg_fill
+                                                                    .gamma_multiply(0.55),
+                                                                egui::Stroke::new(1.0, light),
                                                             )
                                                         };
                                                         // Bare count; "x5" wastes characters.
                                                         let count = r.count().to_string();
-                                                        let button = match texture {
-                                                            Some(h) => {
-                                                                egui::Button::image_and_text(
-                                                                    egui::Image::new(&h)
-                                                                        .fit_to_exact_size(
-                                                                            egui::vec2(18.0, 18.0),
-                                                                        ),
-                                                                    count,
-                                                                )
-                                                            }
-                                                            // No bitmap: raw key (unicode or shortcode).
-                                                            None => egui::Button::new(format!(
-                                                                "{} {count}",
-                                                                r.key
-                                                            )),
-                                                        };
-                                                        let label =
-                                                            reaction_label(&r.key, &self.packs);
                                                         let key = r.key.clone();
-                                                        let resp = ui
-                                                            .add(
-                                                                button
-                                                                    .min_size(egui::vec2(0.0, 26.0))
-                                                                    .fill(fill)
-                                                                    .stroke(stroke),
+                                                        let frame = egui::Frame::new()
+                                                            .fill(fill)
+                                                            .stroke(stroke)
+                                                            .corner_radius(
+                                                                egui::CornerRadius::same(9),
                                                             )
-                                                            // Rich tooltip: plain text renders emoji via
-                                                            // font fallback, mismatching the chip.
-                                                            .on_hover_ui(|ui| {
+                                                            .inner_margin(
+                                                                egui::Margin::symmetric(8, 4),
+                                                            )
+                                                            .show(ui, |ui| {
                                                                 ui.horizontal(|ui| {
-                                                                    self.emoji_widget(
-                                                                        ui, &key, 20.0,
-                                                                    );
+                                                                    ui.spacing_mut().item_spacing.x =
+                                                                        4.0;
+                                                                    match &texture {
+                                                                        Some(h) => {
+                                                                            ui.add(
+                                                                                egui::Image::new(h)
+                                                                                    .fit_to_exact_size(
+                                                                                        egui::vec2(
+                                                                                            18.0,
+                                                                                            18.0,
+                                                                                        ),
+                                                                                    ),
+                                                                            );
+                                                                        }
+                                                                        // No bitmap: raw key (unicode or shortcode).
+                                                                        None => {
+                                                                            ui.label(
+                                                                                egui::RichText::new(
+                                                                                    &key,
+                                                                                ),
+                                                                            );
+                                                                        }
+                                                                    }
                                                                     ui.label(
-                                                                        egui::RichText::new(&label)
-                                                                            .strong(),
+                                                                        egui::RichText::new(&count),
                                                                     );
                                                                 });
-                                                                ui.add_space(2.0);
-                                                                if reactors.is_empty() {
+                                                            });
+                                                        let resp = crate::ui::clickable(ui.interact(
+                                                            frame.response.rect,
+                                                            ui.id().with((
+                                                                "reaction",
+                                                                ri,
+                                                                r.key.as_str(),
+                                                            )),
+                                                            egui::Sense::click(),
+                                                        ))
+                                                            .on_hover_ui(|ui| {
+                                                                ui.spacing_mut().item_spacing.y =
+                                                                    1.0;
+                                                                let unknown = r
+                                                                    .bundled
+                                                                    .saturating_sub(
+                                                                        r.senders.len(),
+                                                                    );
+                                                                if reactors.is_empty()
+                                                                    && unknown == 0
+                                                                {
                                                                     ui.label(
                                                                         egui::RichText::new(
                                                                             "nobody yet",
@@ -6766,6 +7818,17 @@ impl eframe::App for ThraceApp {
                                                                             .small(),
                                                                         );
                                                                     });
+                                                                }
+                                                                if unknown > 0 {
+                                                                    ui.label(
+                                                                        egui::RichText::new(
+                                                                            format!(
+                                                                                "+{unknown} more"
+                                                                            ),
+                                                                        )
+                                                                        .small()
+                                                                        .weak(),
+                                                                    );
                                                                 }
                                                             });
                                                         if resp.clicked() {
@@ -6832,6 +7895,14 @@ impl eframe::App for ThraceApp {
                                     self.theme.gold().gamma_multiply(0.16),
                                 );
                             }
+                            // Local echoes and system notices carry no relations and
+                            // cannot hold a receipt.
+                            if row.sender != "system"
+                                && row_id.starts_with('$')
+                                && ui.is_rect_visible(row_resp.rect)
+                            {
+                                visible.push(row_id.clone());
+                            }
                             ui.add_space(6.0);
                         }
                         if let Some(target) = jump_to {
@@ -6875,6 +7946,7 @@ impl eframe::App for ThraceApp {
                         if std::mem::take(&mut self.jump_to_latest) {
                             ui.scroll_to_cursor(Some(egui::Align::BOTTOM));
                         }
+                        visible
                     });
 
                 let content_h = scroll.content_size.y;
@@ -6892,6 +7964,9 @@ impl eframe::App for ThraceApp {
                 if scroll.state.offset.y < 120.0 && content_h > 0.0 {
                     self.paginate_current();
                 }
+                // Mark read only what the reader has actually reached. Needs this
+                // frame's visible set, so it runs here rather than off a sync batch.
+                self.send_current_read_receipt(scroll.inner.last().map(String::as_str));
 
                 // Distance from newest, in rows: images and one-liners differ in pixels.
                 let view_h = scroll.inner_rect.height();
@@ -7403,7 +8478,9 @@ impl eframe::App for ThraceApp {
                     if !self.input.is_empty() && !self.input.ends_with(' ') {
                         self.input.push(' ');
                     }
-                    self.input.push_str(&format!("{display}: "));
+                    // Full mxid: display names don't notify and don't pill-render.
+                    self.input.push_str(&format!("{mxid} "));
+                    Self::focus_composer(ui.ctx());
                     close = true;
                 }
                 Some(ProfileAction::Verify) => {
@@ -7773,12 +8850,25 @@ async fn load_initial_history(
         .iter()
         .map(|m| (m.mxid.clone(), m.avatar_mxc.clone()))
         .collect();
-    let (rows, token) = load_room_history(&room, &avatars, None, INITIAL_HISTORY).await?;
+    let names = members
+        .iter()
+        .map(|m| (m.mxid.clone(), m.display.clone()))
+        .collect();
+    let (rows, token) = load_room_history(&room, &avatars, &names, None, INITIAL_HISTORY).await?;
     Ok((rows, token, members))
 }
 
 /// One screenful per history request. Older messages load on scroll.
 const INITIAL_HISTORY: u32 = 50;
+
+/// Relation lookups per batch. One HTTP round trip each, so keep the burst small
+/// and let the next frame pick up what the cap left behind — a page of history
+/// drains over a few batches without stalling the UI.
+const RELATION_BURST: usize = 12;
+
+/// Reactions fetched per message. Well past what any message carries in practice;
+/// without it the server picks, and a busy message can come back short.
+const RELATION_PAGE: u32 = 100;
 /// Guard rail: each page is its own round trip.
 const _: () = assert!(INITIAL_HISTORY <= 100);
 
@@ -7787,6 +8877,7 @@ const _: () = assert!(INITIAL_HISTORY <= 100);
 async fn load_room_history(
     room: &matrix_sdk::Room,
     avatars: &std::collections::HashMap<String, Option<String>>,
+    names: &std::collections::HashMap<String, String>,
     from: Option<String>,
     limit: u32,
 ) -> Result<(Vec<TimelineRow>, Option<String>), String> {
@@ -7818,13 +8909,15 @@ async fn load_room_history(
                 continue;
             }
             let sender = ev.sender().map(|s| s.to_string()).unwrap_or("?".into());
-            let display = sender
-                .trim_start_matches('@')
-                .split(':')
-                .next()
-                .unwrap_or(&sender)
-                .to_owned();
+            let display = names
+                .get(&sender)
+                .cloned()
+                .unwrap_or_else(|| localpart(&sender));
             let content = json.get("content").cloned().unwrap_or_default();
+            if let Some((target, new_body, new_fmt)) = edit_replacement(&content) {
+                edit_in(&mut page, &target, new_body, new_fmt);
+                continue;
+            }
             let body = content
                 .get("body")
                 .and_then(|v| v.as_str())
@@ -7845,6 +8938,7 @@ async fn load_room_history(
                 room, &sender, &display, event_id, t, &content, &body, ts, avatar,
             )
             .await;
+            merge_reactions(&mut row.reactions, &bundled_annotations(&json));
             row.txn_id = json
                 .get("unsigned")
                 .and_then(|value| value.get("transaction_id"))
@@ -7860,6 +8954,46 @@ async fn load_room_history(
         rows.push(empty_row("No messages yet — say hi"));
     }
     Ok((rows, next_token))
+}
+
+fn decode_audio(content: &serde_json::Value, body: &str) -> Option<AudioAttachment> {
+    let source: matrix_sdk::ruma::events::room::MediaSource =
+        serde_json::from_value(content.clone()).ok()?;
+    let mxc = media_source_mxc(&source);
+    if mxc.is_empty() || mxc == "mxc://?" {
+        return None;
+    }
+    let info = content.get("info").cloned().unwrap_or_default();
+    let msc = content
+        .get("org.matrix.msc1767.audio")
+        .cloned()
+        .unwrap_or_default();
+    let waveform = msc
+        .get("waveform")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_u64())
+                .map(|v| v.min(1024) as f32 / 1024.0)
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(AudioAttachment {
+        mxc,
+        source,
+        name: body.to_owned(),
+        mime: info
+            .get("mimetype")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_owned(),
+        duration_ms: info
+            .get("duration")
+            .and_then(|v| v.as_u64())
+            .or_else(|| msc.get("duration").and_then(|v| v.as_u64())),
+        waveform,
+        is_voice: content.get("org.matrix.msc3245.voice").is_some(),
+    })
 }
 
 /// Shared decoder for history + live sync, so arrivals render like backfill.
@@ -7914,6 +9048,9 @@ async fn decode_timeline_json(
         .to_owned();
     // `m.video` needs the player path, not a bare filename.
     let is_video = msgtype == "m.video";
+    let audio = (msgtype == "m.audio")
+        .then(|| decode_audio(content, body))
+        .flatten();
     let image = (msgtype == "m.image" || is_video)
         .then_some(())
         .and_then(|_| {
@@ -7964,6 +9101,7 @@ async fn decode_timeline_json(
         reply_to_id,
         thread_count: 0,
         image: image.or(sticker_image),
+        audio,
         reactions: vec![],
         edited: false,
         seen_by: Vec::new(),
@@ -7981,6 +9119,19 @@ fn media_source_mxc(source: &matrix_sdk::ruma::events::room::MediaSource) -> Str
     match source {
         matrix_sdk::ruma::events::room::MediaSource::Plain(uri) => uri.to_string(),
         matrix_sdk::ruma::events::room::MediaSource::Encrypted(file) => file.url.to_string(),
+    }
+}
+
+/// Which media to decode for a timeline still: the event's own thumbnail when it has
+/// one, else the file itself — except for video, where the file is a clip no image
+/// decoder can read, so there is nothing worth asking the server for.
+fn timeline_still_source(
+    img: &ImageAttachment,
+) -> Option<matrix_sdk::ruma::events::room::MediaSource> {
+    match (&img.thumbnail_source, img.is_video) {
+        (Some(thumb), _) => Some(thumb.clone()),
+        (None, false) => Some(img.source.clone()),
+        (None, true) => None,
     }
 }
 
@@ -8016,6 +9167,8 @@ async fn decode_sync_batch(
     }
     let mut avatar_memo: std::collections::HashMap<String, Option<String>> =
         std::collections::HashMap::new();
+    let mut display_memo: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
     for (room_id, update) in &resp.rooms.joined {
         let room_id_s = room_id.to_string();
         let Some(room) = client.get_room(room_id) else {
@@ -8034,12 +9187,16 @@ async fn decode_sync_batch(
                 .and_then(|v| v.as_str())
                 .unwrap_or("?")
                 .to_owned();
-            let display = sender
-                .trim_start_matches('@')
-                .split(':')
-                .next()
-                .unwrap_or(&sender)
-                .to_owned();
+            let display = match display_memo.get(&sender) {
+                Some(cached) => cached.clone(),
+                None => {
+                    let looked_up = display_name_for_sender(&room, &sender)
+                        .await
+                        .unwrap_or_else(|| localpart(&sender));
+                    display_memo.insert(sender.clone(), looked_up.clone());
+                    looked_up
+                }
+            };
             let event_id = json
                 .get("event_id")
                 .and_then(|v| v.as_str())
@@ -8093,32 +9250,7 @@ async fn decode_sync_batch(
                 continue;
             }
             let content = json.get("content").cloned().unwrap_or_default();
-            // An `m.replace` edit rewrites its target, never appends a new row.
-            let relates = content.get("m.relates_to").cloned().unwrap_or_default();
-            if relates.get("rel_type").and_then(|v| v.as_str()) == Some("m.replace") {
-                let target = relates
-                    .get("event_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_owned();
-                // `m.new_content` is the replacement; top-level body is the legacy fallback.
-                let new = content.get("m.new_content").cloned().unwrap_or_default();
-                let new_body = new
-                    .get("body")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| {
-                        content
-                            .get("body")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or_default()
-                            .trim_start_matches("* ")
-                            .to_owned()
-                    });
-                let new_fmt = new
-                    .get("formatted_body")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_owned);
+            if let Some((target, new_body, new_fmt)) = edit_replacement(&content) {
                 if !target.is_empty() {
                     batch
                         .edits
@@ -8148,6 +9280,7 @@ async fn decode_sync_batch(
                 &room, &sender, &display, event_id, t, &content, &body, ts, avatar,
             )
             .await;
+            merge_reactions(&mut row.reactions, &bundled_annotations(&json));
             // Stamp the server-echoed txn so the local echo is replaced.
             row.txn_id = json
                 .get("unsigned")
@@ -8236,6 +9369,24 @@ async fn avatar_for_sender(room: &matrix_sdk::Room, sender: &str) -> Option<Stri
     member.avatar_url().map(|u| u.to_string())
 }
 
+fn localpart(sender: &str) -> String {
+    sender
+        .trim_start_matches('@')
+        .split(':')
+        .next()
+        .unwrap_or(sender)
+        .to_owned()
+}
+
+async fn display_name_for_sender(room: &matrix_sdk::Room, sender: &str) -> Option<String> {
+    use matrix_sdk::ruma::OwnedUserId;
+    let Ok(uid) = OwnedUserId::try_from(sender) else {
+        return None;
+    };
+    let member = room.get_member_no_sync(&uid).await.ok()??;
+    member.display_name().map(|n| n.to_owned())
+}
+
 fn empty_row(body: &str) -> TimelineRow {
     TimelineRow {
         id: "empty".into(),
@@ -8249,6 +9400,7 @@ fn empty_row(body: &str) -> TimelineRow {
         reply_to_id: None,
         thread_count: 0,
         image: None,
+        audio: None,
         reactions: vec![],
         is_sticker: false,
         txn_id: None,
@@ -8494,10 +9646,44 @@ mod tests {
             edited: false,
             seen_by: Vec::new(),
             image: None,
+            audio: None,
             reactions: vec![],
             is_sticker: false,
             txn_id: txn.map(str::to_owned),
         }
+    }
+
+    fn attachment(mxc: &str, is_video: bool, thumb: Option<&str>) -> ImageAttachment {
+        ImageAttachment {
+            mxc: mxc.into(),
+            source: plain_media_source(mxc),
+            thumbnail_source: thumb.map(plain_media_source),
+            name: "clip.mp4".into(),
+            w: 1920,
+            h: 1080,
+            is_video,
+            duration_ms: Some(9_000),
+        }
+    }
+
+    #[test]
+    fn video_without_a_thumbnail_asks_for_no_still() {
+        // Asking downloads the whole clip for the image decoder to reject it.
+        assert!(timeline_still_source(&attachment("mxc://hs/clip", true, None)).is_none());
+    }
+
+    #[test]
+    fn video_with_a_thumbnail_decodes_the_thumbnail() {
+        let clip = attachment("mxc://hs/clip", true, Some("mxc://hs/poster"));
+        let source = timeline_still_source(&clip).expect("a thumbnail is an image");
+        assert_eq!(media_source_mxc(&source), "mxc://hs/poster");
+    }
+
+    #[test]
+    fn image_without_a_thumbnail_falls_back_to_the_file() {
+        let pic = attachment("mxc://hs/pic", false, None);
+        let source = timeline_still_source(&pic).expect("an image decodes from its file");
+        assert_eq!(media_source_mxc(&source), "mxc://hs/pic");
     }
 
     #[test]
@@ -8681,6 +9867,79 @@ mod tests {
     }
 
     #[test]
+    fn decode_audio_reads_msc1767_voice_notes() {
+        let content = serde_json::json!({
+            "body": "Voice message",
+            "msgtype": "m.audio",
+            "url": "mxc://hs/aaa",
+            "info": {"mimetype": "audio/ogg", "size": 1234},
+            "org.matrix.msc1767.audio": {"duration": 1500, "size": 1234, "waveform": [0, 512, 1024, 2048]},
+            "org.matrix.msc3245.voice": {},
+        });
+        let audio = decode_audio(&content, "Voice message").expect("audio must decode");
+        assert_eq!(audio.mxc, "mxc://hs/aaa");
+        assert_eq!(audio.mime, "audio/ogg");
+        assert_eq!(audio.duration_ms, Some(1500));
+        assert_eq!(audio.waveform, vec![0.0, 0.5, 1.0, 1.0]);
+        assert!(audio.is_voice);
+    }
+
+    #[test]
+    fn decode_audio_accepts_plain_music_without_msc_keys() {
+        let content = serde_json::json!({
+            "body": "song.mp3",
+            "msgtype": "m.audio",
+            "url": "mxc://hs/bbb",
+            "info": {"mimetype": "audio/mpeg", "duration": 180000},
+        });
+        let audio = decode_audio(&content, "song.mp3").expect("audio must decode");
+        assert_eq!(audio.duration_ms, Some(180000));
+        assert!(audio.waveform.is_empty());
+        assert!(!audio.is_voice);
+    }
+
+    #[test]
+    fn localpart_strips_sigil_and_server() {
+        assert_eq!(localpart("@alice:hs"), "alice");
+        assert_eq!(localpart("@bob:matrix.org"), "bob");
+        assert_eq!(localpart("?"), "?");
+    }
+
+    #[test]
+    fn history_page_folds_edits_instead_of_appending() {
+        let content = serde_json::json!({
+            "body": " * fixed",
+            "msgtype": "m.text",
+            "m.new_content": {"body": "fixed", "msgtype": "m.text"},
+            "m.relates_to": {"rel_type": "m.replace", "event_id": "$a"},
+        });
+        let (target, body, _) = edit_replacement(&content).expect("edit must parse");
+        assert_eq!(target, "$a");
+        let mut page = vec![row("$a", "@me:hs", "teh original", None)];
+        assert!(edit_in(&mut page, &target, body, None));
+        assert_eq!(page.len(), 1, "edit must not append a row");
+        assert_eq!(page[0].body, "fixed");
+        assert!(page[0].edited);
+    }
+
+    #[test]
+    fn edit_replacement_ignores_non_edits() {
+        for content in [
+            serde_json::json!({"body": "hi"}),
+            serde_json::json!({"body": "hi", "m.relates_to": {"m.in_reply_to": {"event_id": "$a"}}}),
+            serde_json::json!({"body": "hi", "m.relates_to": {"rel_type": "m.thread", "event_id": "$a"}}),
+        ] {
+            assert!(edit_replacement(&content).is_none());
+        }
+        let missing_target = serde_json::json!({
+            "body": " * x",
+            "m.relates_to": {"rel_type": "m.replace"},
+        });
+        let (target, _, _) = edit_replacement(&missing_target).expect("still an edit shape");
+        assert!(target.is_empty(), "callers skip target-less edits");
+    }
+
+    #[test]
     fn mention_prefix_only_completes_the_word_being_typed() {
         assert_eq!(mention_prefix("hey @al"), Some("@al"));
         assert_eq!(mention_prefix("@al"), Some("@al"));
@@ -8690,6 +9949,73 @@ mod tests {
         assert_eq!(mention_prefix("@bob said hi"), None);
         // Full mxid: nothing left to complete.
         assert_eq!(mention_prefix("@bob:matrix.org"), None);
+    }
+
+    fn mention_member(mxid: &str, display: &str) -> Member {
+        Member {
+            display: display.into(),
+            mxid: mxid.into(),
+            online: true,
+            avatar_mxc: None,
+        }
+    }
+
+    fn emoji_packs() -> PackStore {
+        let mut packs = PackStore::new();
+        packs.upsert_pack(crate::matrix::ImagePack {
+            address: None,
+            display_name: "test".into(),
+            images: vec![crate::matrix::PackImage {
+                shortcode: "dance".into(),
+                mxc_url: "mxc://hs/aaa".into(),
+                is_sticker: false,
+            }],
+        });
+        packs
+    }
+
+    #[test]
+    fn mention_bodies_link_the_mxid_not_the_nickname() {
+        let members = [mention_member("@alice:hs", "Alice Cooper")];
+        let (plain, html) = rich_bodies_in(&members, &PackStore::new(), "hi @alice:hs yo");
+        assert_eq!(plain, "hi @alice:hs yo");
+        let html = html.expect("a mention is rich text");
+        assert!(
+            html.contains("<a href=\"https://matrix.to/#/@alice:hs\">Alice Cooper</a>"),
+            "pill links the mxid, labels the display name: {html}"
+        );
+        // The notifier sees the real user id, not a nickname.
+        let ids = mentioned_ids_in(&members, "hi @alice:hs yo");
+        assert_eq!(ids, ["@alice:hs"]);
+    }
+
+    #[test]
+    fn mention_and_emoji_share_one_message() {
+        // The mxid's colon must not eat the `:shortcode:` after it.
+        let members = [mention_member("@alice:hs", "Alice")];
+        let (plain, html) = rich_bodies_in(&members, &emoji_packs(), "hi @alice:hs :dance:");
+        assert_eq!(plain, "hi @alice:hs :dance:");
+        let html = html.expect("mention + emoji is rich text");
+        assert!(html.contains("matrix.to/#/@alice:hs"), "pill kept: {html}");
+        assert!(html.contains("data-mx-emoticon"), "emoji kept: {html}");
+        assert!(html.contains("mxc://hs/aaa"), "emoji image kept: {html}");
+    }
+
+    #[test]
+    fn plain_text_stays_plain() {
+        let members = [mention_member("@alice:hs", "Alice")];
+        let (plain, html) = rich_bodies_in(&members, &emoji_packs(), "just words");
+        assert_eq!(plain, "just words");
+        assert!(html.is_none());
+        assert!(mentioned_ids_in(&members, "just words").is_empty());
+    }
+
+    #[test]
+    fn shortcode_scan_ignores_stray_colons() {
+        assert_eq!(shortcode_end(":dance:"), Some(7));
+        assert_eq!(shortcode_end(":hs rest"), None);
+        assert_eq!(shortcode_end("dance:"), None);
+        assert_eq!(shortcode_end(":has space:"), None);
     }
 
     #[test]
@@ -8851,6 +10177,7 @@ mod tests {
                 user: "@c:hs".into(),
                 event_id: "$r".into(),
             }],
+            bundled: 0,
         }];
         rows[0].edited = true;
 
@@ -9046,6 +10373,201 @@ mod tests {
             "averyverylongdis…"
         );
         assert_eq!(truncate_name("🦀🦀🦀🦀🦀", 3), "🦀🦀🦀…");
+    }
+
+    #[test]
+    fn bundled_annotations_seed_counts_without_senders() {
+        let event = serde_json::json!({
+            "type": "m.room.message",
+            "content": {"body": "hi", "msgtype": "m.text"},
+            "unsigned": {"m.relations": {"m.annotation": {"chunk": [
+                {"type": "m.reaction", "key": "👍", "count": 3},
+                {"type": "m.reaction", "key": "", "count": 1},
+                {"type": "m.reaction", "key": "🎉", "count": 0},
+            ]}}},
+        });
+        let groups = bundled_annotations(&event);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].key, "👍");
+        assert_eq!(groups[0].count(), 3);
+        assert!(bundled_annotations(&serde_json::json!({})).is_empty());
+    }
+
+    #[test]
+    fn live_senders_merge_into_bundled_counts() {
+        let mut reactions = bundled_annotations(&serde_json::json!({
+            "unsigned": {"m.relations": {"m.annotation": {"chunk": [
+                {"type": "m.reaction", "key": "👍", "count": 3},
+            ]}}},
+        }));
+        merge_reactions(
+            &mut reactions,
+            &[Reaction {
+                key: "👍".into(),
+                senders: vec![Reactor {
+                    user: "@b:hs".into(),
+                    event_id: "$r1".into(),
+                }],
+                bundled: 0,
+            }],
+        );
+        assert_eq!(reactions.len(), 1);
+        assert_eq!(reactions[0].count(), 3);
+        assert!(reactions[0].owns("@b:hs"));
+    }
+
+    #[test]
+    fn parse_relation_accepts_matching_reactions_only() {
+        let hit = serde_json::json!({
+            "type": "m.reaction",
+            "sender": "@b:hs",
+            "event_id": "$r1",
+            "content": {"m.relates_to": {
+                "rel_type": "m.annotation",
+                "event_id": "$msg",
+                "key": "👍",
+            }},
+        });
+        let react = parse_relation(&hit, "$msg").expect("must parse");
+        assert_eq!(react.key, "👍");
+        assert_eq!(react.sender, "@b:hs");
+        assert_eq!(react.event_id, "$r1");
+        assert!(parse_relation(&hit, "$other").is_none());
+        let wrong_type = serde_json::json!({
+            "type": "m.room.message",
+            "sender": "@b:hs",
+            "event_id": "$r1",
+            "content": {"body": "hi"},
+        });
+        assert!(parse_relation(&wrong_type, "$msg").is_none());
+    }
+
+    /// A room's loaded timeline: oldest first, newest last.
+    fn loaded(ids: &[&str]) -> Vec<TimelineRow> {
+        ids.iter().map(|id| row(id, "@a:hs", "hi", None)).collect()
+    }
+
+    fn fetched(ids: &[&str]) -> std::collections::HashSet<String> {
+        ids.iter().map(|id| (*id).to_owned()).collect()
+    }
+
+    #[test]
+    fn relation_targets_cover_loaded_messages_without_bundle_gate() {
+        let rows = loaded(&["$a", "$b"]);
+        assert_eq!(
+            ThraceApp::relation_targets(&rows, &fetched(&[]), 25),
+            vec!["$b".to_owned(), "$a".to_owned()],
+            "newest first, no bundle needed"
+        );
+        assert_eq!(
+            ThraceApp::relation_targets(&rows, &fetched(&["$b"]), 25),
+            vec!["$a".to_owned()]
+        );
+        assert!(ThraceApp::relation_targets(&[], &fetched(&[]), 25).is_empty());
+    }
+
+    #[test]
+    fn relation_targets_reach_older_messages_once_the_newest_are_fetched() {
+        // The regression: capping before dropping resolved ids pinned the window
+        // to the newest screenful, so once those were fetched every older page
+        // was starved and no request was ever issued.
+        let rows: Vec<TimelineRow> = (0..40)
+            .map(|i| row(&format!("${i}"), "@a:hs", "hi", None))
+            .collect();
+        // Everything from $15 up is already resolved.
+        let done: std::collections::HashSet<String> = (15..40).map(|i| format!("${i}")).collect();
+        let targets = ThraceApp::relation_targets(&rows, &done, 12);
+        assert_eq!(targets.len(), 12, "older messages must still be reachable");
+        assert!(
+            targets.iter().all(|id| !done.contains(id)),
+            "already-resolved messages must not be re-requested: {targets:?}"
+        );
+        assert_eq!(targets[0], "$14", "newest unresolved first");
+    }
+
+    #[test]
+    fn relation_targets_cap_the_burst() {
+        let rows = loaded(&["$a", "$b", "$c", "$d"]);
+        assert_eq!(
+            ThraceApp::relation_targets(&rows, &fetched(&[]), 2),
+            vec!["$d".to_owned(), "$c".to_owned()],
+            "a page drains newest first, a burst at a time"
+        );
+    }
+
+    #[test]
+    fn relation_targets_skip_what_cannot_carry_reactions() {
+        // System notices and un-acked local echoes have no relations to fetch.
+        let notice = TimelineRow {
+            sender: "system".into(),
+            ..row("$s", "@a:hs", "joined", None)
+        };
+        let rows = vec![
+            notice,
+            row("local-1", "@me:hs", "sending", Some("t1")),
+            row("$a", "@a:hs", "hi", None),
+        ];
+        assert_eq!(
+            ThraceApp::relation_targets(&rows, &fetched(&[]), 25),
+            vec!["$a".to_owned()]
+        );
+    }
+
+    #[test]
+    fn a_receipt_waits_until_the_newest_message_is_on_screen() {
+        let rows = [
+            row("$a", "@a:hs", "old", None),
+            row("$b", "@b:hs", "new", None),
+        ];
+        assert_eq!(
+            receipt_target(&rows, Some("$b"), true, None),
+            Some("$b"),
+            "at the bottom of a focused window"
+        );
+        assert_eq!(
+            receipt_target(&rows, Some("$a"), true, None),
+            None,
+            "scrolled up: the newest message has not been seen"
+        );
+        assert_eq!(
+            receipt_target(&rows, None, true, None),
+            None,
+            "nothing on screen"
+        );
+    }
+
+    #[test]
+    fn a_receipt_waits_for_window_focus() {
+        let rows = [row("$b", "@b:hs", "new", None)];
+        assert_eq!(receipt_target(&rows, Some("$b"), false, None), None);
+        // Refocusing with the same message on screen sends it.
+        assert_eq!(receipt_target(&rows, Some("$b"), true, None), Some("$b"));
+    }
+
+    #[test]
+    fn a_receipt_is_not_resent_for_the_same_message() {
+        let rows = [row("$b", "@b:hs", "new", None)];
+        assert_eq!(receipt_target(&rows, Some("$b"), true, Some("$b")), None);
+        // A different room's last receipt must not suppress this one.
+        assert_eq!(
+            receipt_target(&rows, Some("$b"), true, Some("$other")),
+            Some("$b")
+        );
+    }
+
+    #[test]
+    fn system_notices_never_carry_a_receipt() {
+        let notice = TimelineRow {
+            sender: "system".into(),
+            ..row("$s", "@a:hs", "joined", None)
+        };
+        let rows = [row("$b", "@b:hs", "new", None), notice];
+        // The notice is the last row but never enters the visible set, so the
+        // real message below it is what gets marked read.
+        assert_eq!(receipt_target(&rows, Some("$b"), true, None), Some("$b"));
+        // A local echo cannot be receipted either.
+        let echo = [row("local-1", "@me:hs", "sending", Some("t1"))];
+        assert_eq!(receipt_target(&echo, Some("local-1"), true, None), None);
     }
 
     #[test]

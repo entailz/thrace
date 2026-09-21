@@ -13,6 +13,7 @@ Please see LICENSE in the repository root for full details.
 //! runtime; the UI thread only pumps channels and paints egui.
 
 pub mod app;
+pub mod audio;
 pub mod config;
 pub mod embed;
 pub mod emoji;
@@ -43,23 +44,19 @@ fn install_fonts(ctx: &egui::Context) {
     const UI_FONTS: &[&str] = &[
         "/usr/share/fonts/ttf-readex-pro/ReadexPro-Regular.ttf",
         "~/.local/share/fonts/ReadexPro-Regular.ttf",
-        // Variable font: skrifa renders its default instance.
         "/usr/share/fonts/TTF/Rubik%5Bwght%5D.ttf",
         "/usr/share/fonts/TTF/Rubik.ttf",
     ];
-    // Monospace, used by the `ui.monospace` chrome.
     const MONO_FONTS: &[&str] = &[
         "/usr/share/fonts/TTF/JetBrainsMono-Regular.ttf",
         "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
         "/usr/share/fonts/TTF/FiraMono-Regular.ttf",
     ];
-    // Fallback only; fills glyphs the primary lacks.
     const SYMBOL_FONTS: &[&str] = &[
         "/usr/share/fonts/TTF/Symbola.ttf",
         "/usr/share/fonts/OTF/Symbola.otf",
         "/usr/share/fonts/noto/NotoSansSymbols2-Regular.ttf",
     ];
-    // Outline glyphs, so egui can rasterise them — see `ui::icons`.
     const ICON_FONTS: &[&str] = &[
         "/usr/share/fonts/TTF/SymbolsNerdFont-Regular.ttf",
         "/usr/share/fonts/SpaceMono/SymbolsNerdFont-Regular.ttf",
@@ -70,9 +67,10 @@ fn install_fonts(ctx: &egui::Context) {
     fn read_first(paths: &[&str]) -> Option<Vec<u8>> {
         for path in paths {
             let resolved = match path.strip_prefix("~/") {
-                Some(rest) => std::env::var("HOME")
-                    .ok()
-                    .map(|h| std::path::PathBuf::from(h).join(rest))?,
+                Some(rest) => match std::env::var("HOME") {
+                    Ok(h) => std::path::PathBuf::from(h).join(rest),
+                    Err(_) => continue,
+                },
                 None => std::path::PathBuf::from(path),
             };
             if let Ok(bytes) = std::fs::read(&resolved) {
@@ -82,60 +80,64 @@ fn install_fonts(ctx: &egui::Context) {
         None
     }
 
-    let mut fonts = egui::FontDefinitions::default();
+    let ctx = ctx.clone();
+    std::thread::spawn(move || {
+        let mut fonts = egui::FontDefinitions::default();
 
-    // Primary faces first to win over egui defaults; symbol font last, gaps only.
-    if let Some(bytes) = read_first(UI_FONTS) {
-        fonts
-            .font_data
-            .insert("ui".into(), egui::FontData::from_owned(bytes).into());
-        fonts
-            .families
-            .entry(egui::FontFamily::Proportional)
-            .or_default()
-            .insert(0, "ui".into());
-    }
-    if let Some(bytes) = read_first(MONO_FONTS) {
-        fonts
-            .font_data
-            .insert("mono".into(), egui::FontData::from_owned(bytes).into());
-        fonts
-            .families
-            .entry(egui::FontFamily::Monospace)
-            .or_default()
-            .insert(0, "mono".into());
-    }
-    // Icons before symbols: same codepoints, Material wins.
-    if let Some(bytes) = read_first(ICON_FONTS) {
-        fonts
-            .font_data
-            .insert("icons".into(), egui::FontData::from_owned(bytes).into());
-        for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+        // Primary faces first to win over egui defaults; symbol font last, gaps only.
+        if let Some(bytes) = read_first(UI_FONTS) {
+            fonts
+                .font_data
+                .insert("ui".into(), egui::FontData::from_owned(bytes).into());
             fonts
                 .families
-                .entry(family)
+                .entry(egui::FontFamily::Proportional)
                 .or_default()
-                .push("icons".into());
+                .insert(0, "ui".into());
         }
-    } else {
-        eprintln!(
-            "thrace: no icon font found — toolbar icons will be blank boxes.\n\
+        if let Some(bytes) = read_first(MONO_FONTS) {
+            fonts
+                .font_data
+                .insert("mono".into(), egui::FontData::from_owned(bytes).into());
+            fonts
+                .families
+                .entry(egui::FontFamily::Monospace)
+                .or_default()
+                .insert(0, "mono".into());
+        }
+        // Icons before symbols: same codepoints, Material wins.
+        if let Some(bytes) = read_first(ICON_FONTS) {
+            fonts
+                .font_data
+                .insert("icons".into(), egui::FontData::from_owned(bytes).into());
+            for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+                fonts
+                    .families
+                    .entry(family)
+                    .or_default()
+                    .push("icons".into());
+            }
+        } else {
+            eprintln!(
+                "thrace: no icon font found — toolbar icons will be blank boxes.\n\
              install `ttf-nerd-fonts-symbols` (Symbols Nerd Font) to fix."
-        );
-    }
-    if let Some(bytes) = read_first(SYMBOL_FONTS) {
-        fonts
-            .font_data
-            .insert("symbols".into(), egui::FontData::from_owned(bytes).into());
-        for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-            fonts
-                .families
-                .entry(family)
-                .or_default()
-                .push("symbols".into());
+            );
         }
-    }
-    ctx.set_fonts(fonts);
+        if let Some(bytes) = read_first(SYMBOL_FONTS) {
+            fonts
+                .font_data
+                .insert("symbols".into(), egui::FontData::from_owned(bytes).into());
+            for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+                fonts
+                    .families
+                    .entry(family)
+                    .or_default()
+                    .push("symbols".into());
+            }
+        }
+        ctx.set_fonts(fonts);
+        ctx.request_repaint();
+    });
 }
 
 /// Pick the windowing backend, returning `(name, file-drops-work)`.
