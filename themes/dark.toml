@@ -1,0 +1,19 @@
+name = "dark"
+parent = "dark"
+
+[palette]
+bg = "#141414"
+panel = "#1e1e1e"
+text = "#e6e6e6"
+muted = "#8a8a8a"
+selection = "#2a2a2a"
+accent = "#5cc8c0"
+gold = "#d9a648"
+
+[timeline]
+timestamp = "#7a7a7a"
+nick_colors = ["#7dd3d8", "#8ab4f8", "#c3c3c3", "#d9a648", "#9aa0a6", "#5cc8c0"]
+bevel_width = 0.0
+
+[font]
+mono_size = 14.0

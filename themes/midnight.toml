@@ -1,0 +1,17 @@
+name = "midnight"
+parent = "dark"
+
+[palette]
+bg = "#000000"
+panel = "#1a1a1a"
+text = "#e0e0e0"
+selection = "#333366"
+accent = "#88aaff"
+
+[timeline]
+timestamp = "#555555"
+nick_colors = ["#88aaff", "#ff88aa", "#88ffaa", "#ffcc88", "#cc88ff", "#88ffff"]
+bevel_width = 0.0
+
+[font]
+mono_size = 14.0

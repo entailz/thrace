@@ -1,0 +1,12 @@
+# Faster linking. This crate pulls in matrix-sdk and eframe, so the final
+# link dominates an incremental rebuild; mold cuts it to roughly a second.
+#
+# Passed through the C compiler driver, which is what resolves the linker on
+# PATH. If mold is ever missing, swap `mold` for `lld` here (or drop the file
+# entirely to fall back to GNU ld) — a missing linker fails the build rather
+# than silently falling back.
+#
+# Note: rustflags are part of Cargo's fingerprint, so changing this line
+# forces one full rebuild.
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]

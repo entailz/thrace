@@ -1,0 +1,17 @@
+name = "win98-teal"
+parent = "dark"
+
+[palette]
+bg = "#008080"
+panel = "#c0c0c0"
+text = "#000000"
+selection = "#000080"
+accent = "#000080"
+
+[timeline]
+timestamp = "#004040"
+nick_colors = ["#000080", "#800000", "#005500", "#663300", "#660066", "#004466"]
+bevel_width = 2.0
+
+[font]
+mono_size = 14.0

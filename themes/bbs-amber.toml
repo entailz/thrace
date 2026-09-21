@@ -1,0 +1,17 @@
+name = "bbs-amber"
+parent = "dark"
+
+[palette]
+bg = "#1a0f00"
+panel = "#2a1a00"
+text = "#ffb000"
+selection = "#503000"
+accent = "#ffb000"
+
+[timeline]
+timestamp = "#7a5200"
+nick_colors = ["#ffb000", "#ffdd88", "#ff8800", "#ccaa00", "#ffeeaa"]
+bevel_width = 0.0
+
+[font]
+mono_size = 15.0
