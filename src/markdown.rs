@@ -334,6 +334,20 @@ pub fn render_html(html: &str) -> RichMessage {
                 if closing {
                     stack.pop();
                 } else {
+                    if name == "code" {
+                        if let Some((lang, _)) = pre_buf.as_mut() {
+                            if lang.is_empty() {
+                                if let Some(class) = tag_attr(tag, "class") {
+                                    if let Some(found) = class
+                                        .split_whitespace()
+                                        .find_map(|part| part.strip_prefix("language-"))
+                                    {
+                                        *lang = found.to_owned();
+                                    }
+                                }
+                            }
+                        }
+                    }
                     let (b, i, c, l, r) = stack.last().cloned().unwrap_or_default();
                     let link = if name == "a" {
                         tag_attr(tag, "href")
@@ -650,7 +664,9 @@ mod tests {
     #[test]
     fn html_pre_becomes_code_block() {
         let m = render_html("<pre><code class=\"language-rust\">let x = 1;</code></pre>");
-        assert!(matches!(m.blocks.last(), Some(Block::Code(_))));
+        assert!(
+            matches!(m.blocks.last(), Some(Block::Code(cb)) if cb.lang == "rust" && cb.code == "let x = 1;")
+        );
     }
 
     #[test]

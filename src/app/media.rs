@@ -181,9 +181,11 @@ impl ThraceApp {
         if !self.embeds.claim(&url) {
             return;
         }
-        let Some(rule) = crate::embed::card_rule(&self.embed_rules, &url).cloned() else {
+        let github = crate::embed::github_endpoint(&url).is_some();
+        let rule = crate::embed::card_rule(&self.embed_rules, &url).cloned();
+        if !github && rule.is_none() {
             return;
-        };
+        }
         if self.embed_tx.is_none() {
             let (tx, rx) = std::sync::mpsc::channel();
             self.embed_tx = Some(tx);
@@ -192,7 +194,11 @@ impl ThraceApp {
         let tx = self.embed_tx.clone().unwrap();
         let ctx = self.ctx.clone();
         self.rt.spawn(async move {
-            let result = crate::embed::fetch(&rule, &url).await.ok();
+            let result = if github {
+                crate::embed::fetch_github(&url).await.ok()
+            } else {
+                crate::embed::fetch(&rule.unwrap(), &url).await.ok()
+            };
             let _ = tx.send((url, result));
             ctx.request_repaint();
         });

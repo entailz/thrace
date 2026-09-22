@@ -18,6 +18,7 @@ pub mod config;
 pub mod embed;
 pub mod emoji;
 pub mod emoji_font;
+pub mod highlight;
 pub mod history_queue;
 pub mod markdown;
 pub mod matrix;

@@ -574,6 +574,8 @@ impl ThraceApp {
             // through the cache and come back empty.
             return;
         }
+        self.pinned_room = None;
+        self.pinned_messages.clear();
         // Stash outgoing timeline + members — unless we already arrived:
         // dropping an empty DM stub points `current` at the target, and
         // stashing then would overwrite its cache with empty rows.

@@ -53,6 +53,38 @@ impl eframe::App for ThraceApp {
                 self.ignored_users = list;
             }
         }
+        if let Some((room_id, result)) = self.pinned_rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
+            if self.pinned_room.as_deref() == Some(room_id.as_str()) {
+                self.pinned_loading = false;
+                match result {
+                    Ok(mut messages) => {
+                        for message in &mut messages {
+                            if let Some(row) = self.rows.iter().find(|row| row.id == message.id) {
+                                if message.body == "Message unavailable"
+                                    || message.body.starts_with("Encrypted message")
+                                {
+                                    if !row.body.is_empty() {
+                                        message.body = row.body.clone();
+                                    }
+                                }
+                                if message.sender.is_empty() {
+                                    message.sender = row.sender.clone();
+                                    message.display_name = row.display_name.clone();
+                                    message.avatar_mxc = row.avatar_mxc.clone();
+                                    message.ts = row.ts.clone();
+                                }
+                                if message.timeline_row.is_none() {
+                                    message.timeline_row = Some(row.clone());
+                                }
+                            }
+                        }
+                        self.pinned_messages = messages;
+                    }
+                    Err(error) => self.pinned_error = Some(error),
+                }
+            }
+            self.pinned_rx = None;
+        }
         // Link cards and thumbnails.
         loop {
             let got = match &self.embed_rx {
@@ -285,6 +317,26 @@ impl eframe::App for ThraceApp {
                             self.settings_display_name = self.display_for(&me);
                             self.refresh_devices();
                             self.refresh_ignored();
+                        }
+                    }
+                    if let (Some(client), Some(room_id)) =
+                        (self.client.as_ref(), self.current_room_id())
+                    {
+                        let count = matrix_sdk::ruma::OwnedRoomId::try_from(room_id.as_str())
+                            .ok()
+                            .and_then(|id| client.get_room(&id))
+                            .and_then(|room| room.pinned_event_ids())
+                            .map_or(0, |ids| ids.len());
+                        let label = if count > 0 {
+                            format!("Pinned ({count})")
+                        } else {
+                            "Pinned".to_owned()
+                        };
+                        if ui
+                            .selectable_label(self.pinned_room.is_some(), label)
+                            .clicked()
+                        {
+                            self.open_pins();
                         }
                     }
                     if crate::ui::icon_toggle(
@@ -693,102 +745,227 @@ impl eframe::App for ThraceApp {
 
         // Members (click → DM). Clamped width + truncated names keep the
         // panel from widening every frame on long display names.
-        egui::Panel::right("nicks")
-            .default_size(170.0)
-            .min_size(120.0)
-            .max_size(260.0)
-            .show(ui, |ui| {
-                ui.label(
-                    egui::RichText::new(format!("MEMBERS — {}", self.members.len()))
-                        .small()
-                        .weak()
-                        .strong(),
-                )
-                .on_hover_text("click a member for their profile");
-                ui.add_space(4.0);
-                let mut dm_target: Option<(String, String)> = None;
-                let mut profile_open: Option<(String, egui::Pos2)> = None;
-                // Cloned once; the loop calls `&mut self` avatar methods.
-                let members = std::mem::take(&mut self.members);
-                for m in &members {
-                    // Allocated rect, not a right-aligned button that overlays long names.
-                    let (rect, resp) = ui.allocate_exact_size(
-                        egui::vec2(ui.available_width(), 30.0),
-                        egui::Sense::click(),
+        let pins_open = self.pinned_room.is_some()
+            && self.pinned_room.as_deref() == self.current_room_id().as_deref();
+        let sidebar = egui::Panel::right("nicks");
+        let sidebar = if pins_open {
+            sidebar.default_size(380.0).min_size(340.0).max_size(480.0)
+        } else {
+            sidebar.default_size(170.0).min_size(120.0).max_size(260.0)
+        };
+        sidebar.show(ui, |ui| {
+            if pins_open {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(format!("PINNED — {}", self.pinned_messages.len()))
+                            .small()
+                            .strong(),
                     );
-                    let hovered = ui.rect_contains_pointer(rect);
-                    if hovered {
-                        ui.painter().rect_filled(
-                            rect,
-                            egui::CornerRadius::same(7),
-                            ui.visuals().widgets.hovered.bg_fill,
-                        );
-                    }
-                    let av = 22.0;
-                    let av_rect = egui::Rect::from_center_size(
-                        egui::pos2(rect.left() + 6.0 + av / 2.0, rect.center().y),
-                        egui::vec2(av, av),
-                    );
-                    self.paint_avatar_at(ui, av_rect, &m.avatar_mxc, &m.display);
-                    // Presence dot against the avatar.
-                    ui.painter().circle_filled(
-                        egui::pos2(av_rect.right() - 2.0, av_rect.bottom() - 2.0),
-                        3.5,
-                        if m.online {
-                            self.theme.gold()
-                        } else {
-                            ui.visuals().weak_text_color()
-                        },
-                    );
-                    // Reserve the DM button width only while hovered.
-                    let text_x = av_rect.right() + 9.0;
-                    let reserve = if hovered { 32.0 } else { 6.0 };
-                    let avail = (rect.right() - text_x - reserve).max(20.0);
-                    ui.painter().text(
-                        egui::pos2(text_x, rect.center().y),
-                        egui::Align2::LEFT_CENTER,
-                        truncate_name(&m.display, (avail / 7.0).max(3.0) as usize),
-                        egui::FontId::proportional(13.0),
-                        self.nick_color(&m.display),
-                    );
-                    if hovered {
-                        let btn = egui::Rect::from_center_size(
-                            egui::pos2(rect.right() - 17.0, rect.center().y),
-                            egui::vec2(26.0, 26.0),
-                        );
-                        if ui
-                            .put(
-                                btn,
-                                egui::Button::new(
-                                    egui::RichText::new(crate::ui::icons::CHAT).size(15.0),
-                                ),
-                            )
-                            .on_hover_text(format!("Message {}", m.display))
-                            .clicked()
-                        {
-                            dm_target = Some((m.mxid.clone(), m.display.clone()));
-                        }
-                    }
-                    if resp
-                        .on_hover_text(format!("{} ({}) — view profile", m.display, m.mxid))
+                    if ui
+                        .small_button("×")
+                        .on_hover_text("Close pinned messages")
                         .clicked()
                     {
-                        let anchor = ui
-                            .ctx()
-                            .pointer_latest_pos()
-                            .unwrap_or_else(|| rect.right_top());
-                        profile_open = Some((m.mxid.clone(), anchor));
+                        self.pinned_room = None;
+                    }
+                });
+                ui.separator();
+                if self.pinned_loading {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Loading pins…");
+                    });
+                } else if let Some(error) = &self.pinned_error {
+                    ui.label(error);
+                } else if self.pinned_messages.is_empty() {
+                    ui.label("No pinned messages in this room.");
+                } else {
+                    let mut jump_to = None;
+                    let pins = self.pinned_messages.clone();
+                    egui::ScrollArea::vertical()
+                        .id_salt("pinned_messages_sidebar")
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            for message in &pins {
+                                let card_width = ui.available_width();
+                                let card = egui::Frame::group(ui.style()).show(ui, |ui| {
+                                    ui.set_max_width((card_width - 16.0).max(60.0));
+                                    ui.horizontal(|ui| {
+                                        let (rect, _) = ui.allocate_exact_size(
+                                            egui::vec2(32.0, 32.0),
+                                            egui::Sense::hover(),
+                                        );
+                                        self.paint_avatar_at(
+                                            ui,
+                                            rect,
+                                            &message.avatar_mxc,
+                                            &message.display_name,
+                                        );
+                                        ui.vertical(|ui| {
+                                            ui.label(
+                                                egui::RichText::new(&message.display_name)
+                                                    .color(self.nick_color(&message.sender))
+                                                    .strong(),
+                                            )
+                                            .on_hover_text(&message.sender);
+                                            ui.label(
+                                                egui::RichText::new(&message.ts).small().weak(),
+                                            );
+                                        });
+                                    });
+                                    if let Some(row) = &message.timeline_row {
+                                        if let Some(img) = &row.image {
+                                            self.render_pinned_image(ui, img);
+                                            if !row.body.is_empty() {
+                                                self.render_body(
+                                                    ui,
+                                                    &row.body,
+                                                    row.formatted.as_deref(),
+                                                );
+                                            }
+                                        } else if let Some(audio) = &row.audio {
+                                            self.render_audio(ui, &row.id, audio);
+                                        } else {
+                                            self.render_body(
+                                                ui,
+                                                &row.body,
+                                                row.formatted.as_deref(),
+                                            );
+                                        }
+                                    } else {
+                                        ui.label(&message.body);
+                                    }
+                                });
+                                if ui
+                                    .interact(
+                                        card.response.rect,
+                                        ui.id().with(("pinned_event", &message.id)),
+                                        egui::Sense::click(),
+                                    )
+                                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                    .clicked()
+                                {
+                                    jump_to = Some(message.clone());
+                                }
+                            }
+                        });
+                    if let Some(message) = jump_to {
+                        let id = message.id.clone();
+                        if !self.rows.iter().any(|row| row.id == id) {
+                            if let Some(row) = message.timeline_row {
+                                let rows = std::rc::Rc::make_mut(&mut self.rows);
+                                let at = rows
+                                    .iter()
+                                    .position(|existing| {
+                                        existing.origin_server_ts > row.origin_server_ts
+                                    })
+                                    .unwrap_or(rows.len());
+                                rows.insert(at, row);
+                            } else {
+                                self.status =
+                                    "This pinned event cannot be shown in the message timeline"
+                                        .into();
+                                return;
+                            }
+                        }
+                        self.scroll_to_event = Some(id.clone());
+                        self.highlight_event = Some((id, ui.ctx().input(|i| i.time) + 1.6));
+                        self.pinned_room = None;
                     }
                 }
-                // Restore before `open_dm` / `profile_of` can see an empty list.
-                self.members = members;
-                if let Some((mxid, pos)) = profile_open {
-                    self.profile_target = Some((mxid, pos, ui.ctx().cumulative_pass_nr()));
+                return;
+            }
+            ui.label(
+                egui::RichText::new(format!("MEMBERS — {}", self.members.len()))
+                    .small()
+                    .weak()
+                    .strong(),
+            )
+            .on_hover_text("click a member for their profile");
+            ui.add_space(4.0);
+            let mut dm_target: Option<(String, String)> = None;
+            let mut profile_open: Option<(String, egui::Pos2)> = None;
+            // Cloned once; the loop calls `&mut self` avatar methods.
+            let members = std::mem::take(&mut self.members);
+            for m in &members {
+                // Allocated rect, not a right-aligned button that overlays long names.
+                let (rect, resp) = ui.allocate_exact_size(
+                    egui::vec2(ui.available_width(), 30.0),
+                    egui::Sense::click(),
+                );
+                let hovered = ui.rect_contains_pointer(rect);
+                if hovered {
+                    ui.painter().rect_filled(
+                        rect,
+                        egui::CornerRadius::same(7),
+                        ui.visuals().widgets.hovered.bg_fill,
+                    );
                 }
-                if let Some((mxid, display)) = dm_target {
-                    self.open_dm(&mxid, &display);
+                let av = 22.0;
+                let av_rect = egui::Rect::from_center_size(
+                    egui::pos2(rect.left() + 6.0 + av / 2.0, rect.center().y),
+                    egui::vec2(av, av),
+                );
+                self.paint_avatar_at(ui, av_rect, &m.avatar_mxc, &m.display);
+                // Presence dot against the avatar.
+                ui.painter().circle_filled(
+                    egui::pos2(av_rect.right() - 2.0, av_rect.bottom() - 2.0),
+                    3.5,
+                    if m.online {
+                        self.theme.gold()
+                    } else {
+                        ui.visuals().weak_text_color()
+                    },
+                );
+                // Reserve the DM button width only while hovered.
+                let text_x = av_rect.right() + 9.0;
+                let reserve = if hovered { 32.0 } else { 6.0 };
+                let avail = (rect.right() - text_x - reserve).max(20.0);
+                ui.painter().text(
+                    egui::pos2(text_x, rect.center().y),
+                    egui::Align2::LEFT_CENTER,
+                    truncate_name(&m.display, (avail / 7.0).max(3.0) as usize),
+                    egui::FontId::proportional(13.0),
+                    self.nick_color(&m.display),
+                );
+                if hovered {
+                    let btn = egui::Rect::from_center_size(
+                        egui::pos2(rect.right() - 17.0, rect.center().y),
+                        egui::vec2(26.0, 26.0),
+                    );
+                    if ui
+                        .put(
+                            btn,
+                            egui::Button::new(
+                                egui::RichText::new(crate::ui::icons::CHAT).size(15.0),
+                            ),
+                        )
+                        .on_hover_text(format!("Message {}", m.display))
+                        .clicked()
+                    {
+                        dm_target = Some((m.mxid.clone(), m.display.clone()));
+                    }
                 }
-            });
+                if resp
+                    .on_hover_text(format!("{} ({}) — view profile", m.display, m.mxid))
+                    .clicked()
+                {
+                    let anchor = ui
+                        .ctx()
+                        .pointer_latest_pos()
+                        .unwrap_or_else(|| rect.right_top());
+                    profile_open = Some((m.mxid.clone(), anchor));
+                }
+            }
+            // Restore before `open_dm` / `profile_of` can see an empty list.
+            self.members = members;
+            if let Some((mxid, pos)) = profile_open {
+                self.profile_target = Some((mxid, pos, ui.ctx().cumulative_pass_nr()));
+            }
+            if let Some((mxid, display)) = dm_target {
+                self.open_dm(&mxid, &display);
+            }
+        });
 
         // Status bar.
         egui::Panel::bottom("status").show(ui, |ui| {
@@ -819,7 +996,10 @@ impl eframe::App for ThraceApp {
         });
 
         // Input with reply bar + slash palette.
-        egui::Panel::bottom("input").show(ui, |ui| {
+        let input_frame =
+            egui::Frame::side_top_panel(ui.style()).inner_margin(egui::Margin::symmetric(8, 8));
+        let input_panel = egui::Panel::bottom("input").frame(input_frame);
+        input_panel.show(ui, |ui| {
             if let Some(id) = self.replying_to.clone() {
                 // Who and what, not the raw event id. Name and quote stay
                 // apart so the quote can carry real emoji.
@@ -943,135 +1123,170 @@ impl eframe::App for ThraceApp {
                     ui.label(egui::RichText::new("Drop to attach").small());
                 });
             }
-            ui.horizontal(|ui| {
-                use crate::ui::icons;
-                // Tooltip carries the caveat: Wayland/winit delivers no file drops.
-                let attach_tip = format!("Attach a file\n{}", self.drop_hint);
-                if crate::ui::icon_button(ui, icons::ATTACH, &attach_tip).clicked() {
-                    self.pick_files();
-                }
-                if crate::ui::icon_button(ui, icons::PASTE, "Paste image from clipboard (Ctrl+V)")
+            let composer_lines = self.input.lines().count().clamp(1, 4) as f32;
+            let composer_height = 34.0 + (composer_lines - 1.0) * 18.0;
+            ui.allocate_ui_with_layout(
+                egui::vec2(ui.available_width(), composer_height),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    use crate::ui::icons;
+                    // Tooltip carries the caveat: Wayland/winit delivers no file drops.
+                    let attach_tip = format!("Attach a file\n{}", self.drop_hint);
+                    if crate::ui::icon_button(ui, icons::ATTACH, &attach_tip).clicked() {
+                        self.pick_files();
+                    }
+                    if crate::ui::icon_button(
+                        ui,
+                        icons::PASTE,
+                        "Paste image from clipboard (Ctrl+V)",
+                    )
                     .clicked()
-                {
-                    self.paste_clipboard(true);
-                }
+                    {
+                        self.paste_clipboard(true);
+                    }
 
-                let can_send = !self.input.trim().is_empty() || !self.pending_uploads.is_empty();
-                // Reserve room so the field never squeezes off the trailing controls.
-                let trailing = crate::ui::ICON_BUTTON * 3.0 + 40.0;
-                // Up arrow on an empty composer edits your last message.
-                if self.input.is_empty()
-                    && self.editing.is_none()
-                    && ui.input(|i| i.key_pressed(egui::Key::ArrowUp))
-                {
-                    self.start_edit_last();
-                }
-                if self.editing.is_some() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                    self.editing = None;
-                    self.input.clear();
-                }
-                // Name the room; the placeholder says where you type, not a manual.
-                let hint = if self.editing.is_some() {
-                    "Editing — Enter to save, Esc to cancel".to_owned()
-                } else {
-                    match self.rooms.get(self.current) {
-                        Some(room) if room.is_dm => {
-                            format!("Message {}", room.name.trim_start_matches('@'))
+                    let can_send =
+                        !self.input.trim().is_empty() || !self.pending_uploads.is_empty();
+                    // Reserve room so the field never squeezes off the trailing controls.
+                    let trailing = crate::ui::ICON_BUTTON * 3.0 + 40.0;
+                    // Up arrow on an empty composer edits your last message.
+                    if self.input.is_empty()
+                        && self.editing.is_none()
+                        && ui.input(|i| i.key_pressed(egui::Key::ArrowUp))
+                    {
+                        self.start_edit_last();
+                    }
+                    if self.editing.is_some() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                        self.editing = None;
+                        self.input.clear();
+                    }
+                    // Name the room; the placeholder says where you type, not a manual.
+                    let hint = if self.editing.is_some() {
+                        "Editing — Enter to save, Esc to cancel".to_owned()
+                    } else {
+                        match self.rooms.get(self.current) {
+                            Some(room) if room.is_dm => {
+                                format!("Message {}", room.name.trim_start_matches('@'))
+                            }
+                            Some(room) => format!("Message {}", room.name),
+                            None => "Message".to_owned(),
                         }
-                        Some(room) => format!("Message {}", room.name),
-                        None => "Message".to_owned(),
-                    }
-                };
-                let resp = ui.add(
-                    egui::TextEdit::singleline(&mut self.input)
-                        .id(Self::composer_id())
-                        .hint_text(hint)
-                        .desired_width((ui.available_width() - trailing).max(120.0))
-                        .margin(egui::Margin::symmetric(10, 7)),
-                );
-                // Snapshot the @-mention state first: while the dropdown is
-                // open Enter/Tab accept the highlight and hand focus back,
-                // they never send a bare "@user" with an empty message.
-                let mention_state: Option<(String, Vec<Member>)> = mention_prefix(&self.input)
-                    .map(str::to_owned)
-                    .map(|prefix| {
-                        let hits = self.mention_hits(&prefix);
-                        (prefix, hits)
-                    });
-                let mention_open = mention_state
-                    .as_ref()
-                    .is_some_and(|(_, hits)| !hits.is_empty());
-                let enter_pressed =
-                    resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                // Gated on composer focus: Tab belongs to other fields when
-                // they hold it.
-                let tab_pressed = resp.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Tab));
-                if mention_open {
-                    let (prefix, hits) = mention_state.expect("open means state");
-                    self.mention_selected %= hits.len();
-                    if ui.input(|i| i.key_pressed(egui::Key::ArrowDown)) {
-                        self.mention_selected = (self.mention_selected + 1) % hits.len();
-                    }
-                    if ui.input(|i| i.key_pressed(egui::Key::ArrowUp)) {
-                        self.mention_selected =
-                            (self.mention_selected + hits.len() - 1) % hits.len();
-                    }
-                    if enter_pressed || tab_pressed {
-                        let m = hits[self.mention_selected % hits.len()].clone();
-                        self.accept_mention(&m, &prefix);
-                        Self::focus_composer(ui.ctx());
-                    }
-                } else if enter_pressed {
-                    // A partial command completes; an exact verb runs straight away.
-                    match self.slash_matches() {
-                        Some((verb, matches)) if !matches.iter().any(|(c, _)| c[1..] == verb) => {
-                            let idx = self.slash_selected % matches.len();
-                            let cmd = matches[idx].0;
+                    };
+                    let field_width = (ui.available_width() - trailing).max(120.0);
+                    let resp = ui
+                        .allocate_ui_with_layout(
+                            egui::vec2(field_width, composer_height),
+                            egui::Layout::top_down(egui::Align::LEFT),
+                            |ui| {
+                                egui::ScrollArea::vertical()
+                                    .max_height(112.0)
+                                    .auto_shrink([false, true])
+                                    .show(ui, |ui| {
+                                        ui.add(
+                                            egui::TextEdit::multiline(&mut self.input)
+                                                .id(Self::composer_id())
+                                                .hint_text(hint)
+                                                .desired_width(field_width)
+                                                .desired_rows(1)
+                                                .return_key(egui::KeyboardShortcut::new(
+                                                    egui::Modifiers::SHIFT,
+                                                    egui::Key::Enter,
+                                                ))
+                                                .margin(egui::Margin::symmetric(10, 7)),
+                                        )
+                                    })
+                                    .inner
+                            },
+                        )
+                        .inner;
+                    // Snapshot the @-mention state first: while the dropdown is
+                    // open Enter/Tab accept the highlight and hand focus back,
+                    // they never send a bare "@user" with an empty message.
+                    let mention_state: Option<(String, Vec<Member>)> = mention_prefix(&self.input)
+                        .map(str::to_owned)
+                        .map(|prefix| {
+                            let hits = self.mention_hits(&prefix);
+                            (prefix, hits)
+                        });
+                    let mention_open = mention_state
+                        .as_ref()
+                        .is_some_and(|(_, hits)| !hits.is_empty());
+                    let enter_pressed = resp.has_focus()
+                        && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
+                    // Gated on composer focus: Tab belongs to other fields when
+                    // they hold it.
+                    let tab_pressed =
+                        resp.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Tab));
+                    if mention_open {
+                        let (prefix, hits) = mention_state.expect("open means state");
+                        self.mention_selected %= hits.len();
+                        if ui.input(|i| i.key_pressed(egui::Key::ArrowDown)) {
+                            self.mention_selected = (self.mention_selected + 1) % hits.len();
+                        }
+                        if ui.input(|i| i.key_pressed(egui::Key::ArrowUp)) {
+                            self.mention_selected =
+                                (self.mention_selected + hits.len() - 1) % hits.len();
+                        }
+                        if enter_pressed || tab_pressed {
+                            let m = hits[self.mention_selected % hits.len()].clone();
+                            self.accept_mention(&m, &prefix);
+                            Self::focus_composer(ui.ctx());
+                        }
+                    } else if enter_pressed {
+                        // A partial command completes; an exact verb runs straight away.
+                        match self.slash_matches() {
+                            Some((verb, matches))
+                                if !matches.iter().any(|(c, _)| c[1..] == verb) =>
+                            {
+                                let idx = self.slash_selected % matches.len();
+                                let cmd = matches[idx].0;
+                                self.complete_slash(cmd);
+                                resp.request_focus();
+                            }
+                            _ => self.send_current_input(),
+                        }
+                    } else if tab_pressed {
+                        // Tab completes a slash highlight without running it.
+                        if let Some((_, matches)) = self.slash_matches() {
+                            let selected = self.slash_selected % matches.len();
+                            let cmd = matches[selected].0;
                             self.complete_slash(cmd);
                             resp.request_focus();
                         }
-                        _ => self.send_current_input(),
                     }
-                } else if tab_pressed {
-                    // Tab completes a slash highlight without running it.
-                    if let Some((_, matches)) = self.slash_matches() {
-                        let selected = self.slash_selected % matches.len();
-                        let cmd = matches[selected].0;
-                        self.complete_slash(cmd);
-                        resp.request_focus();
-                    }
-                }
 
-                let picker_open = self.show_picker;
-                if crate::ui::icon_toggle(
-                    ui,
-                    icons::EMOJI,
-                    "Emoji, custom emoji and stickers",
-                    picker_open,
-                )
-                .clicked()
-                {
-                    self.show_picker = !picker_open;
-                    self.picker_opened_frame = ui.ctx().cumulative_pass_nr();
-                    self.picker_tab = PickerTab::Emoji;
-                }
-                if crate::ui::icon_button(ui, icons::STICKER, "Stickers").clicked() {
-                    self.show_picker = true;
-                    self.picker_opened_frame = ui.ctx().cumulative_pass_nr();
-                    self.picker_tab = PickerTab::Stickers;
-                }
-                // Send is the accent action; greys out when there is nothing to send.
-                let tint = if can_send {
-                    self.theme.gold()
-                } else {
-                    ui.visuals().weak_text_color()
-                };
-                if crate::ui::icon_button_tinted(ui, icons::SEND, "Send (Enter)", tint).clicked()
-                    && can_send
-                {
-                    self.send_current_input();
-                }
-            });
+                    let picker_open = self.show_picker;
+                    if crate::ui::icon_toggle(
+                        ui,
+                        icons::EMOJI,
+                        "Emoji, custom emoji and stickers",
+                        picker_open,
+                    )
+                    .clicked()
+                    {
+                        self.show_picker = !picker_open;
+                        self.picker_opened_frame = ui.ctx().cumulative_pass_nr();
+                        self.picker_tab = PickerTab::Emoji;
+                    }
+                    if crate::ui::icon_button(ui, icons::STICKER, "Stickers").clicked() {
+                        self.show_picker = true;
+                        self.picker_opened_frame = ui.ctx().cumulative_pass_nr();
+                        self.picker_tab = PickerTab::Stickers;
+                    }
+                    // Send is the accent action; greys out when there is nothing to send.
+                    let tint = if can_send {
+                        self.theme.gold()
+                    } else {
+                        ui.visuals().weak_text_color()
+                    };
+                    if crate::ui::icon_button_tinted(ui, icons::SEND, "Send (Enter)", tint)
+                        .clicked()
+                        && can_send
+                    {
+                        self.send_current_input();
+                    }
+                },
+            );
             // @-mention autocomplete: word under the cursor starting with '@'.
             // Keys are handled beside the composer above (it owns `resp`);
             // this block only draws the list and takes clicks.
@@ -1222,6 +1437,7 @@ impl eframe::App for ThraceApp {
                         // Real events on screen this frame, in timeline order. Drives
                         // reaction backfill and the read receipt.
                         let mut visible: Vec<String> = Vec::new();
+                        let mut messages_below = 0usize;
                         // Consumed by whichever row matches it this frame.
                         let scroll_target = self.scroll_to_event.take();
                         let now = ui.ctx().input(|i| i.time);
@@ -1235,6 +1451,9 @@ impl eframe::App for ThraceApp {
                         let rows = std::rc::Rc::clone(&self.rows);
                         for (ri, row) in rows.iter().enumerate() {
                             let row_id = row.id.clone();
+                            let grouped = row.sender != "system"
+                                && ri > 0
+                                && rows[ri - 1].sender == row.sender;
 
                             // Live target row first; plain-text quote fallback when not loaded.
                             let reply_view: Option<(String, String, Option<String>)> = row
@@ -1259,20 +1478,28 @@ impl eframe::App for ThraceApp {
                             let gutter = if seen.is_empty() { 0.0 } else { 86.0 };
                             let row_resp = ui
                                 .horizontal_top(|ui| {
-                                    // Avatar: cached mxc texture, else colored initial.
-                                    let amxc = row.avatar_mxc.clone();
-                                    let dname = row.display_name.clone();
-                                    let sender = row.sender.clone();
-                                    let avatar_resp = self
-                                        .render_avatar(ui, &amxc, &dname)
-                                        .on_hover_text(format!("{} — view profile", row.sender));
-                                    if avatar_resp.clicked() {
-                                        profile_open = Some((
-                                            sender.clone(),
-                                            ui.ctx()
-                                                .pointer_latest_pos()
-                                                .unwrap_or_else(|| avatar_resp.rect.right_top()),
-                                        ));
+                                    // Keep continuation text aligned with the first message.
+                                    if grouped {
+                                        // A real widget gets the same following item spacing as
+                                        // the avatar. `add_space` does not, shifting the text.
+                                        ui.allocate_exact_size(
+                                            egui::vec2(28.0, 16.0),
+                                            egui::Sense::hover(),
+                                        )
+                                        .1
+                                        .on_hover_text(&row.ts);
+                                    } else {
+                                        let avatar_resp = self
+                                            .render_avatar(ui, &row.avatar_mxc, &row.display_name)
+                                            .on_hover_text(format!("{} — view profile", row.sender));
+                                        if avatar_resp.clicked() {
+                                            profile_open = Some((
+                                                row.sender.clone(),
+                                                ui.ctx().pointer_latest_pos().unwrap_or_else(|| {
+                                                    avatar_resp.rect.right_top()
+                                                }),
+                                            ));
+                                        }
                                     }
                                     let content_w = (ui.available_width() - gutter).max(140.0);
                                     ui.allocate_ui_with_layout(
@@ -1281,61 +1508,66 @@ impl eframe::App for ThraceApp {
                                         |ui| {
                                             // Tight gap; the default left messages double-spaced.
                                             ui.spacing_mut().item_spacing.y = 1.0;
-                                            // Header: name + time + actions.
-                                            ui.horizontal_wrapped(|ui| {
-                                                let name_resp = ui
-                                                    .add(
-                                                        egui::Label::new(
-                                                            egui::RichText::new(&row.display_name)
-                                                                .strong()
-                                                                .color(
-                                                                    self.nick_color(
-                                                                        &row.display_name,
-                                                                    ),
-                                                                ),
+                                            // A sender's header appears once per consecutive run.
+                                            if !grouped || row.edited || row.is_sticker {
+                                                ui.horizontal_wrapped(|ui| {
+                                                    if !grouped {
+                                                        let name_resp = ui
+                                                            .add(
+                                                                egui::Label::new(
+                                                                    egui::RichText::new(&row.display_name)
+                                                                        .strong()
+                                                                        .color(
+                                                                            self.nick_color(
+                                                                                &row.display_name,
+                                                                            ),
+                                                                        ),
+                                                                )
+                                                                .selectable(false)
+                                                                .sense(egui::Sense::click()),
+                                                            )
+                                                            .on_hover_text(format!(
+                                                                "{} — view profile", row.sender
+                                                            ));
+                                                        if name_resp.clicked() {
+                                                            profile_open = Some((
+                                                                row.sender.clone(),
+                                                                ui.ctx()
+                                                                    .pointer_latest_pos()
+                                                                    .unwrap_or_else(|| {
+                                                                        name_resp.rect.right_top()
+                                                                    }),
+                                                            ));
+                                                        }
+                                                        if !row.ts.is_empty() {
+                                                            ui.label(
+                                                                egui::RichText::new(&row.ts).weak().small(),
+                                                            );
+                                                        }
+                                                    }
+                                                    if row.edited {
+                                                        ui.label(
+                                                            egui::RichText::new("(edited)")
+                                                                .weak()
+                                                                .small(),
                                                         )
-                                                        .selectable(false)
-                                                        .sense(egui::Sense::click()),
-                                                    )
-                                                    .on_hover_text(format!(
-                                                        "{sender} — view profile"
-                                                    ));
-                                                if name_resp.clicked() {
-                                                    profile_open = Some((
-                                                        sender.clone(),
-                                                        ui.ctx()
-                                                            .pointer_latest_pos()
-                                                            .unwrap_or_else(|| {
-                                                                name_resp.rect.right_top()
-                                                            }),
-                                                    ));
-                                                }
-                                                if !row.ts.is_empty() {
-                                                    ui.label(
-                                                        egui::RichText::new(&row.ts).weak().small(),
-                                                    );
-                                                }
-                                                if row.edited {
-                                                    ui.label(
-                                                        egui::RichText::new("(edited)")
-                                                            .weak()
-                                                            .small(),
-                                                    )
-                                                    .on_hover_text("this message was edited");
-                                                }
-                                                if row.is_sticker {
-                                                    crate::ui::icon_label(
-                                                        ui,
-                                                        crate::ui::icons::STICKER,
-                                                        ui.visuals().weak_text_color(),
-                                                    )
-                                                    .on_hover_text("sticker");
-                                                }
-                                                // No header buttons; actions live in right-click, reply on double-click.
-                                            });
+                                                        .on_hover_text("this message was edited");
+                                                    }
+                                                    if row.is_sticker {
+                                                        crate::ui::icon_label(
+                                                            ui,
+                                                            crate::ui::icons::STICKER,
+                                                            ui.visuals().weak_text_color(),
+                                                        )
+                                                        .on_hover_text("sticker");
+                                                    }
+                                                    // No header buttons; actions live in right-click, reply on double-click.
+                                                });
+                                            }
                                             // Reply chain.
                                             if let Some((who, snip, avatar)) = reply_view.clone() {
-                                                // Accent bar + "In reply to" + avatar + name.
+                                                // Keep the preview on one line and truncate it
+                                                // when the message column is narrow.
                                                 let colour = self.nick_color(&who);
                                                 let reply_size = self.reply_text_size();
                                                 let line = ui.horizontal(|ui| {
@@ -1359,18 +1591,40 @@ impl eframe::App for ThraceApp {
                                                         egui::Sense::hover(),
                                                     );
                                                     let ring = ui.visuals().panel_fill;
-                                                    self.paint_avatar_circle(
-                                                        ui, av, &avatar, &who, ring,
-                                                    );
-                                                    ui.label(
-                                                        egui::RichText::new(&who)
-                                                            .size(reply_size)
-                                                            .color(colour)
-                                                            .strong(),
+                                                    self.paint_avatar_circle(ui, av, &avatar, &who, ring);
+                                                    let measured_name = ui.fonts_mut(|fonts| {
+                                                        fonts
+                                                            .layout_no_wrap(
+                                                                who.clone(),
+                                                                egui::FontId::proportional(reply_size),
+                                                                colour,
+                                                            )
+                                                            .size()
+                                                            .x
+                                                    });
+                                                    let name_width = measured_name
+                                                        .min(200.0)
+                                                        .min(ui.available_width() * 0.4)
+                                                        .max(1.0);
+                                                    ui.add_sized(
+                                                        egui::vec2(name_width, 16.0),
+                                                        egui::Label::new(
+                                                            egui::RichText::new(&who)
+                                                                .size(reply_size)
+                                                                .color(colour)
+                                                                .strong(),
+                                                        )
+                                                        .truncate(),
                                                     );
                                                     if !snip.trim().is_empty() {
-                                                        let text = snippet(&snip, 70);
-                                                        self.reply_preview(ui, &text);
+                                                        ui.add(
+                                                            egui::Label::new(
+                                                                egui::RichText::new(snippet(&snip, 70))
+                                                                    .size(reply_size),
+                                                            )
+                                                            .truncate(),
+                                                        )
+                                                        .on_hover_text(&snip);
                                                     }
                                                 });
                                                 // Hover-only labels inside, so this steals no clicks.
@@ -1656,8 +1910,11 @@ impl eframe::App for ThraceApp {
                                         .unwrap_or_else(|| row_resp.rect.left_top()),
                                 ));
                             }
-                            // Landed from a reply jump: scroll into view and flash.
-                            if scroll_target.as_deref() == Some(row_id.as_str()) {
+                            // A visible target only needs the flash. Centering it again
+                            // fights the scroll area's current position and can jitter.
+                            if scroll_target.as_deref() == Some(row_id.as_str())
+                                && !ui.is_rect_visible(row_resp.rect)
+                            {
                                 row_resp.scroll_to_me(Some(egui::Align::Center));
                             }
                             if highlight.as_deref() == Some(row_id.as_str()) {
@@ -1665,6 +1922,12 @@ impl eframe::App for ThraceApp {
                                     row_resp.rect.expand2(egui::vec2(4.0, 2.0)),
                                     egui::CornerRadius::same(6),
                                     self.theme.gold().gamma_multiply(0.16),
+                                );
+                                ui.painter().rect_stroke(
+                                    row_resp.rect.expand2(egui::vec2(4.0, 2.0)),
+                                    egui::CornerRadius::same(6),
+                                    egui::Stroke::new(1.5, self.theme.gold()),
+                                    egui::StrokeKind::Outside,
                                 );
                             }
                             // Local echoes and system notices carry no relations and
@@ -1675,7 +1938,14 @@ impl eframe::App for ThraceApp {
                             {
                                 visible.push(row_id.clone());
                             }
-                            ui.add_space(6.0);
+                            if row.sender != "system"
+                                && row_resp.rect.top() >= ui.clip_rect().bottom()
+                            {
+                                messages_below += 1;
+                            }
+                            ui.add_space(if rows.get(ri + 1).is_some_and(|next| {
+                                row.sender != "system" && next.sender == row.sender
+                            }) { 2.0 } else { 6.0 });
                         }
                         if let Some(target) = jump_to {
                             // Only when the target is loaded.
@@ -1718,7 +1988,7 @@ impl eframe::App for ThraceApp {
                         if std::mem::take(&mut self.jump_to_latest) {
                             ui.scroll_to_cursor(Some(egui::Align::BOTTOM));
                         }
-                        visible
+                        (visible, messages_below)
                     });
 
                 let content_h = scroll.content_size.y;
@@ -1738,19 +2008,10 @@ impl eframe::App for ThraceApp {
                 }
                 // Mark read only what the reader has actually reached. Needs this
                 // frame's visible set, so it runs here rather than off a sync batch.
-                self.send_current_read_receipt(scroll.inner.last().map(String::as_str));
+                self.send_current_read_receipt(scroll.inner.0.last().map(String::as_str));
 
-                // Distance from newest, in rows: images and one-liners differ in pixels.
-                let view_h = scroll.inner_rect.height();
-                let below = (content_h - scroll.state.offset.y - view_h).max(0.0);
-                let row_h = if self.rows.is_empty() {
-                    0.0
-                } else {
-                    content_h / self.rows.len() as f32
-                };
-                const ROWS_BEFORE_JUMP: f32 = 30.0;
-                let hidden_rows = if row_h > 0.0 { below / row_h } else { 0.0 };
-                if hidden_rows >= ROWS_BEFORE_JUMP {
+                let messages_below = scroll.inner.1;
+                if messages_below > 0 {
                     let area = scroll.inner_rect;
                     let size = 38.0;
                     let btn = egui::Rect::from_min_size(
@@ -1777,10 +2038,31 @@ impl eframe::App for ThraceApp {
                         )
                         .frame(false),
                     );
+                    let count_label = if messages_below > 99 {
+                        "99+".to_owned()
+                    } else {
+                        messages_below.to_string()
+                    };
+                    let badge = egui::Rect::from_center_size(
+                        egui::pos2(btn.right() - 1.0, btn.top() + 2.0),
+                        egui::vec2(if messages_below > 99 { 27.0 } else { 21.0 }, 17.0),
+                    );
+                    ui.painter().rect_filled(
+                        badge,
+                        egui::CornerRadius::same(9),
+                        self.theme.gold(),
+                    );
+                    ui.painter().text(
+                        badge.center(),
+                        egui::Align2::CENTER_CENTER,
+                        count_label,
+                        egui::FontId::proportional(10.0),
+                        ui.visuals().extreme_bg_color,
+                    );
                     if resp
                         .on_hover_text(format!(
                             "Jump to latest — {} messages below",
-                            hidden_rows as usize
+                            messages_below
                         ))
                         .clicked()
                     {

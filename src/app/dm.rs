@@ -113,6 +113,7 @@ impl ThraceApp {
         std::rc::Rc::make_mut(&mut self.rows).push(TimelineRow {
             id: "dm-new".into(),
             ts: format_ts(now_millis()),
+            origin_server_ts: 0,
             sender: "system".into(),
             display_name: "system".into(),
             body: format!("Direct message with {display} ({mxid}) — creating room…"),

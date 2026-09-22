@@ -58,11 +58,23 @@ enabled = false
 aliases = ["x.com", "twitter.com", "vxtwitter.com", "fxtwitter.com", "fixupx.com", "fixvx.com", "nitter.net"]
 open_with = "fxtwitter.com"
 api = "https://api.fxtwitter.com"
+
+[[embeds.rules]]
+name = "YouTube / Invidious"
+enabled = false
+aliases = ["youtube.com", "youtu.be", "m.youtube.com"]
+open_with = "inv.nadeko.net"
+api = "https://inv.nadeko.net"
 ```
 
 Each embedder has its own `[[embeds.rules]]` entry. Aliases are the hostnames
 it handles, `open_with` is the host used when opening links, and `api` is
 the preview endpoint. Leave `api` empty to only rewrite links.
+Public GitHub repository, issue, and pull request links also show preview cards.
+They use GitHub's public API and do not require an embed rule.
+Enable the YouTube rule to fetch video cards from an Invidious instance and
+open links there. You can replace its host and API with an instance you trust.
+No Google API key is used.
 
 The `--theme` option overrides the saved theme for that launch. Link previews are off by
 default; enable them in settings. Account preferences such as notifications

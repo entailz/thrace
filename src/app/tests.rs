@@ -23,6 +23,7 @@ fn row(id: &str, sender: &str, body: &str, txn: Option<&str>) -> TimelineRow {
     TimelineRow {
         id: id.into(),
         ts: format_ts(now_millis()),
+        origin_server_ts: 0,
         sender: sender.into(),
         display_name: sender.trim_start_matches('@').into(),
         body: body.into(),
@@ -331,6 +332,8 @@ fn edit_replacement_ignores_non_edits() {
 fn mention_prefix_only_completes_the_word_being_typed() {
     assert_eq!(mention_prefix("hey @al"), Some("@al"));
     assert_eq!(mention_prefix("@al"), Some("@al"));
+    assert_eq!(mention_prefix("first line\n@al"), Some("@al"));
+    assert_eq!(mention_prefix("@al\n"), None);
     // Not a mention at all.
     assert_eq!(mention_prefix("hello there"), None);
     // Only the final word is a candidate; completing must not move the cursor.

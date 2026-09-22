@@ -10,6 +10,30 @@ use crate::app::text::truncate_name;
 use crate::app::{AudioAttachment, ImageAttachment, ThraceApp};
 
 impl ThraceApp {
+    /// Compact, non-interactive thumbnail for the clickable pinned card.
+    pub(in crate::app) fn render_pinned_image(&mut self, ui: &mut egui::Ui, img: &ImageAttachment) {
+        let Some(source) = timeline_still_source(img) else {
+            ui.label(if img.is_video { "Video" } else { "Image" });
+            return;
+        };
+        let cache_key = format!("thumbnail:{}", img.mxc);
+        if let Some(handle) = self
+            .media
+            .texture_for_source(&cache_key, source, Some((320, 320)))
+        {
+            ui.add(
+                egui::Image::new(&handle)
+                    .max_size(egui::vec2(ui.available_width().min(320.0), 150.0)),
+            );
+        } else {
+            ui.label(if img.is_video {
+                "Video loading…"
+            } else {
+                "Image loading…"
+            });
+        }
+    }
+
     /// Timeline image ≤320px wide; placeholder while downloading, error + retry.
     pub(in crate::app) fn render_image(&mut self, ui: &mut egui::Ui, img: &ImageAttachment) {
         let Some(source) = timeline_still_source(img) else {
@@ -23,7 +47,7 @@ impl ThraceApp {
             .texture_for_source(&cache_key, source, Some((320, 320)))
         {
             let size = handle.size_vec2();
-            let w = size.x.min(320.0);
+            let w = size.x.min(320.0).min(ui.available_width().max(48.0));
             let h = if size.x > 0.0 {
                 size.y * (w / size.x)
             } else {
@@ -482,13 +506,10 @@ impl ThraceApp {
         if !body.contains("http") {
             return;
         }
-        let urls: Vec<String> = body
-            .split_whitespace()
-            .filter(|w| w.starts_with("http"))
-            .map(|w| w.trim_end_matches(['.', ',', ')', ']']).to_owned())
-            .collect();
-        for url in urls {
-            if crate::embed::card_rule(&self.embed_rules, &url).is_none() {
+        for url in crate::embed::urls_in_text(body) {
+            if crate::embed::card_rule(&self.embed_rules, &url).is_none()
+                && crate::embed::github_endpoint(&url).is_none()
+            {
                 continue;
             }
             match self.embeds.get(&url).cloned() {
@@ -589,7 +610,7 @@ impl ThraceApp {
                         ui.visuals().weak_text_color(),
                     );
                     ui.hyperlink_to(
-                        egui::RichText::new("Open original").small().weak(),
+                        egui::RichText::new("Open link").small().weak(),
                         embed.link.clone(),
                     );
                 });

@@ -91,7 +91,7 @@ fn resolve_path(
 impl ConfigFile {
     /// Load preferences, creating the file on first launch. Invalid files are left intact.
     pub fn open(path: PathBuf) -> Result<Self> {
-        let saved = match std::fs::read_to_string(&path) {
+        let mut saved = match std::fs::read_to_string(&path) {
             Ok(raw) => toml::from_str::<Config>(&raw)
                 .with_context(|| format!("parse {}", path.display()))?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -101,6 +101,18 @@ impl ConfigFile {
             }
             Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
         };
+        if !saved.embeds.rules.iter().any(|rule| {
+            rule.hosts
+                .iter()
+                .any(|host| host == "youtube.com" || host == "youtu.be")
+        }) {
+            if let Some(youtube) = crate::embed::default_rules()
+                .into_iter()
+                .find(|rule| rule.name == "YouTube / Invidious")
+            {
+                saved.embeds.rules.push(youtube);
+            }
+        }
         saved
             .validate()
             .with_context(|| format!("invalid {}", path.display()))?;
@@ -179,6 +191,25 @@ mod tests {
     }
 
     #[test]
+    fn older_embed_settings_gain_disabled_youtube_rule() {
+        let path = std::env::temp_dir().join(format!(
+            "thrace-old-embeds-{}-{}.toml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, "[[embeds.rules]]\nname = 'X / Twitter'\nenabled = true\naliases = ['x.com']\nopen_with = 'fxtwitter.com'\napi = 'https://api.fxtwitter.com'\n").unwrap();
+        let rules = ConfigFile::open(path.clone()).unwrap().saved.embeds.rules;
+        assert_eq!(rules.len(), 2);
+        assert!(rules[0].enabled);
+        assert_eq!(rules[1].name, "YouTube / Invidious");
+        assert!(!rules[1].enabled);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn preferences_survive_restart_and_invalid_files_are_preserved() {
         let dir = std::env::temp_dir().join(format!(
             "thrace-config-test-{}-{}",
@@ -207,7 +238,7 @@ mod tests {
         assert!(raw.contains("[[embeds.rules]]"));
         assert!(!raw.contains("[[embed_rules]]"));
         let parsed: toml::Value = toml::from_str(&raw).unwrap();
-        assert_eq!(parsed["embeds"]["rules"].as_array().unwrap().len(), 2);
+        assert_eq!(parsed["embeds"]["rules"].as_array().unwrap().len(), 3);
         assert!(parsed["embeds"]["rules"][0]["aliases"]
             .as_array()
             .unwrap()

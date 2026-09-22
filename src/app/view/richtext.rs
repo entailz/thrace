@@ -273,7 +273,15 @@ impl ThraceApp {
                         if !cb.lang.is_empty() {
                             ui.monospace(egui::RichText::new(cb.lang.clone()).small().weak());
                         }
-                        ui.monospace(&cb.code);
+                        let mut code = crate::highlight::layout(
+                            &cb.code,
+                            &cb.lang,
+                            ui.style().text_styles[&egui::TextStyle::Monospace].size,
+                            ui.visuals().text_color(),
+                        );
+                        code.wrap.max_width = ui.available_width();
+                        code.wrap.break_anywhere = true;
+                        ui.add(egui::Label::new(code));
                     });
                 }
             }

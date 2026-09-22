@@ -26,6 +26,112 @@ Please see LICENSE in the repository root for full details.
 
 use std::collections::HashMap;
 
+/// Find links even when prose or Markdown punctuation surrounds them.
+pub fn urls_in_text(body: &str) -> Vec<String> {
+    let mut urls = Vec::new();
+    for (start, _) in body.match_indices("http") {
+        let rest = &body[start..];
+        if !rest.starts_with("https://") && !rest.starts_with("http://") {
+            continue;
+        }
+        let end = rest
+            .find(|c: char| c.is_whitespace() || matches!(c, '<' | '>' | '"' | '\''))
+            .unwrap_or(rest.len());
+        let candidate = rest[..end].trim_end_matches(['.', ',', ';', ':', '!', '?', ')', ']', '}']);
+        if url::Url::parse(candidate).is_ok() && !urls.iter().any(|url| url == candidate) {
+            urls.push(candidate.to_owned());
+        }
+    }
+    urls
+}
+
+/// Public GitHub repositories and their issue/PR pages have API-backed cards.
+pub fn github_endpoint(url: &str) -> Option<String> {
+    let parsed = url::Url::parse(url).ok()?;
+    if parsed.host_str()? != "github.com" {
+        return None;
+    }
+    let parts: Vec<_> = parsed
+        .path_segments()?
+        .filter(|part| !part.is_empty())
+        .collect();
+    let [owner, repo, rest @ ..] = parts.as_slice() else {
+        return None;
+    };
+    if !owner.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        || !repo
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    {
+        return None;
+    }
+    let base = format!("https://api.github.com/repos/{owner}/{repo}");
+    match rest {
+        [] => Some(base),
+        [kind @ ("issues" | "pull"), number] if number.parse::<u64>().ok()? > 0 => Some(format!(
+            "{base}/{}/{number}",
+            if *kind == "pull" { "pulls" } else { "issues" }
+        )),
+        _ => None,
+    }
+}
+
+pub async fn fetch_github(url: &str) -> Result<Embed, String> {
+    let endpoint = github_endpoint(url).ok_or("unsupported GitHub URL")?;
+    let body: serde_json::Value = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .user_agent("thrace")
+        .build()
+        .map_err(|e| e.to_string())?
+        .get(endpoint)
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .error_for_status()
+        .map_err(|e| e.to_string())?
+        .json()
+        .await
+        .map_err(|e| e.to_string())?;
+    parse_github(&body, url)
+}
+
+pub fn parse_github(body: &serde_json::Value, url: &str) -> Result<Embed, String> {
+    let is_repo = body.get("full_name").is_some();
+    let title = body
+        .get(if is_repo { "full_name" } else { "title" })
+        .and_then(|v| v.as_str())
+        .ok_or("GitHub response has no title")?;
+    let description = body
+        .get(if is_repo { "description" } else { "body" })
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    let user = body.get(if is_repo { "owner" } else { "user" });
+    Ok(Embed {
+        author: title.to_owned(),
+        handle: if is_repo {
+            "GitHub repository".into()
+        } else if body.get("pull_request").is_some() || url.contains("/pull/") {
+            format!(
+                "Pull request #{}",
+                body.get("number").and_then(|v| v.as_u64()).unwrap_or(0)
+            )
+        } else {
+            format!(
+                "Issue #{}",
+                body.get("number").and_then(|v| v.as_u64()).unwrap_or(0)
+            )
+        },
+        avatar: user
+            .and_then(|v| v.get("avatar_url"))
+            .and_then(|v| v.as_str())
+            .map(str::to_owned),
+        text: description.chars().take(300).collect(),
+        image: None,
+        link: url.to_owned(),
+    })
+}
+
 /// A platform and the front end to render it with.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct EmbedRule {
@@ -55,22 +161,64 @@ impl EmbedRule {
 
 /// X defaults, including front-end aliases people post from.
 pub fn default_rules() -> Vec<EmbedRule> {
-    vec![EmbedRule {
-        name: "X / Twitter".into(),
-        enabled: false,
-        hosts: vec![
-            "x.com".into(),
-            "twitter.com".into(),
-            "vxtwitter.com".into(),
-            "fxtwitter.com".into(),
-            "fixupx.com".into(),
-            "fixvx.com".into(),
-            "nitter.net".into(),
-        ],
-        open_with: "fxtwitter.com".into(),
-        // fxtwitter answers plain HTTP clients; vxtwitter does not.
-        api: "https://api.fxtwitter.com".into(),
-    }]
+    vec![
+        EmbedRule {
+            name: "X / Twitter".into(),
+            enabled: false,
+            hosts: vec![
+                "x.com".into(),
+                "twitter.com".into(),
+                "vxtwitter.com".into(),
+                "fxtwitter.com".into(),
+                "fixupx.com".into(),
+                "fixvx.com".into(),
+                "nitter.net".into(),
+            ],
+            open_with: "fxtwitter.com".into(),
+            // fxtwitter answers plain HTTP clients; vxtwitter does not.
+            api: "https://api.fxtwitter.com".into(),
+        },
+        EmbedRule {
+            name: "YouTube / Invidious".into(),
+            enabled: false,
+            hosts: vec![
+                "youtube.com".into(),
+                "youtu.be".into(),
+                "m.youtube.com".into(),
+            ],
+            open_with: "inv.nadeko.net".into(),
+            api: "https://inv.nadeko.net".into(),
+        },
+    ]
+}
+
+pub fn youtube_video_id(url: &str) -> Option<String> {
+    let parsed = url::Url::parse(url).ok()?;
+    let host = parsed.host_str()?;
+    let id = if host == "youtu.be" {
+        parsed.path_segments()?.next()?.to_owned()
+    } else if host == "youtube.com" || host.ends_with(".youtube.com") {
+        if parsed.path() == "/watch" {
+            parsed
+                .query_pairs()
+                .find(|(key, _)| key == "v")?
+                .1
+                .into_owned()
+        } else {
+            let mut parts = parsed.path_segments()?;
+            match parts.next()? {
+                "shorts" | "live" | "embed" => parts.next()?.to_owned(),
+                _ => return None,
+            }
+        }
+    } else {
+        return None;
+    };
+    (id.len() == 11
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'))
+    .then_some(id)
 }
 
 #[derive(Debug, Clone)]
@@ -92,6 +240,12 @@ pub fn rewrite(rules: &[EmbedRule], url: &str) -> Option<String> {
     if rule.open_with.is_empty() || rule.open_with.eq_ignore_ascii_case(host) {
         return None;
     }
+    if let Some(id) = youtube_video_id(url) {
+        let mut out = url::Url::parse("https://example.invalid/watch").ok()?;
+        out.set_host(Some(&rule.open_with)).ok()?;
+        out.query_pairs_mut().append_pair("v", &id);
+        return Some(out.to_string());
+    }
     let mut out = parsed.clone();
     out.set_host(Some(&rule.open_with)).ok()?;
     Some(out.to_string())
@@ -100,6 +254,11 @@ pub fn rewrite(rules: &[EmbedRule], url: &str) -> Option<String> {
 pub fn card_rule<'a>(rules: &'a [EmbedRule], url: &str) -> Option<&'a EmbedRule> {
     let parsed = url::Url::parse(url).ok()?;
     let host = parsed.host_str()?;
+    if (host == "youtu.be" || host == "youtube.com" || host.ends_with(".youtube.com"))
+        && youtube_video_id(url).is_none()
+    {
+        return None;
+    }
     rules
         .iter()
         .find(|r| r.enabled && !r.api.is_empty() && r.claims(host))
@@ -108,23 +267,93 @@ pub fn card_rule<'a>(rules: &'a [EmbedRule], url: &str) -> Option<&'a EmbedRule>
 /// Path carries across unchanged; front ends mirror `/user/status/id`.
 pub async fn fetch(rule: &EmbedRule, url: &str) -> Result<Embed, String> {
     let parsed = url::Url::parse(url).map_err(|e| e.to_string())?;
-    let endpoint = format!("{}{}", rule.api.trim_end_matches('/'), parsed.path());
+    let video_id = youtube_video_id(url);
+    let endpoint = match &video_id {
+        Some(id) => format!("{}/api/v1/videos/{id}", rule.api.trim_end_matches('/')),
+        None => format!("{}{}", rule.api.trim_end_matches('/'), parsed.path()),
+    };
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         // Some front ends refuse a request with no agent.
         .user_agent("thrace")
         .build()
         .map_err(|e| e.to_string())?;
-    let body: serde_json::Value = client
-        .get(&endpoint)
-        .send()
-        .await
-        .map_err(|e| format!("{e}"))?
-        .json()
-        .await
-        .map_err(|e| format!("{e}"))?;
+    let body: Result<serde_json::Value, String> = async {
+        client
+            .get(&endpoint)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?
+            .error_for_status()
+            .map_err(|e| e.to_string())?
+            .json()
+            .await
+            .map_err(|e| e.to_string())
+    }
+    .await;
 
-    parse(&body, url)
+    match video_id {
+        Some(id) => {
+            let mut card = body
+                .and_then(|body| parse_invidious(&body, url, &rule.api))
+                .unwrap_or_else(|_| Embed {
+                    author: "YouTube video".into(),
+                    handle: "Preview unavailable".into(),
+                    avatar: None,
+                    text: String::new(),
+                    image: Some(format!(
+                        "{}/vi/{id}/mqdefault.jpg",
+                        rule.api.trim_end_matches('/')
+                    )),
+                    link: url.into(),
+                });
+            card.link = rewrite(&[rule.clone()], url).unwrap_or_else(|| url.into());
+            Ok(card)
+        }
+        None => parse(&body?, url),
+    }
+}
+
+pub fn parse_invidious(body: &serde_json::Value, url: &str, api: &str) -> Result<Embed, String> {
+    let title = body
+        .get("title")
+        .and_then(|v| v.as_str())
+        .ok_or("video has no title")?;
+    let author = body
+        .get("author")
+        .and_then(|v| v.as_str())
+        .unwrap_or("YouTube");
+    let thumbnail = body
+        .get("videoThumbnails")
+        .and_then(|v| v.as_array())
+        .and_then(|v| {
+            v.iter()
+                .find(|v| v.get("quality").and_then(|q| q.as_str()) == Some("medium"))
+                .or_else(|| v.first())
+        })
+        .and_then(|v| v.get("url"))
+        .and_then(|v| v.as_str())
+        .and_then(|path| {
+            let base = url::Url::parse(api).ok()?;
+            let path = url::Url::parse(path)
+                .map(|u| u.path().to_owned())
+                .unwrap_or_else(|_| path.to_owned());
+            base.join(&path).ok().map(|u| u.to_string())
+        });
+    Ok(Embed {
+        author: title.into(),
+        handle: author.into(),
+        avatar: None,
+        text: body
+            .get("description")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .chars()
+            .take(220)
+            .collect(),
+        image: thumbnail,
+        link: url.into(),
+    })
 }
 
 /// Split from the request so field extraction can be tested without network.
@@ -232,6 +461,88 @@ impl EmbedCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn finds_alias_links_inside_prose_and_markdown() {
+        assert_eq!(
+            urls_in_text(
+                "look [here](https://fixupx.com/a/status/1), then https://x.com/b/status/2!"
+            ),
+            vec!["https://fixupx.com/a/status/1", "https://x.com/b/status/2"]
+        );
+        assert_eq!(
+            urls_in_text("https://x.com/a/status/1 plus text"),
+            vec!["https://x.com/a/status/1"]
+        );
+    }
+
+    #[test]
+    fn github_cards_accept_public_repo_issue_and_pull_urls() {
+        assert_eq!(
+            github_endpoint("https://github.com/rust-lang/rust"),
+            Some("https://api.github.com/repos/rust-lang/rust".into())
+        );
+        assert_eq!(
+            github_endpoint("https://github.com/rust-lang/rust/issues/123"),
+            Some("https://api.github.com/repos/rust-lang/rust/issues/123".into())
+        );
+        assert_eq!(
+            github_endpoint("https://github.com/rust-lang/rust/pull/123"),
+            Some("https://api.github.com/repos/rust-lang/rust/pulls/123".into())
+        );
+        assert!(github_endpoint("https://github.com.evil.test/rust-lang/rust").is_none());
+        assert!(github_endpoint("https://github.com/rust-lang/rust/issues/nope").is_none());
+    }
+
+    #[test]
+    fn parses_github_card_data() {
+        let body = serde_json::json!({"title":"Fix preview", "body":"A useful description", "number":42, "user":{"avatar_url":"https://example.test/avatar.png"}});
+        let card = parse_github(&body, "https://github.com/a/b/issues/42").unwrap();
+        assert_eq!(card.author, "Fix preview");
+        assert_eq!(card.handle, "Issue #42");
+        assert_eq!(card.text, "A useful description");
+    }
+
+    #[test]
+    fn youtube_links_use_invidious_when_enabled() {
+        let mut rules = default_rules();
+        assert!(!rules[1].enabled);
+        assert!(card_rule(&rules, "https://youtu.be/dQw4w9WgXcQ").is_none());
+        rules[1].enabled = true;
+        for url in [
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=15",
+            "https://youtu.be/dQw4w9WgXcQ",
+            "https://youtube.com/shorts/dQw4w9WgXcQ",
+        ] {
+            assert_eq!(youtube_video_id(url).as_deref(), Some("dQw4w9WgXcQ"));
+            assert!(card_rule(&rules, url).is_some());
+            assert_eq!(
+                rewrite(&rules, url).as_deref(),
+                Some("https://inv.nadeko.net/watch?v=dQw4w9WgXcQ")
+            );
+        }
+        assert!(youtube_video_id("https://youtube.com/watch?v=bad").is_none());
+    }
+
+    #[test]
+    fn parses_invidious_without_google_image_hosts() {
+        let body = serde_json::json!({
+            "title": "A video", "author": "Creator", "description": "Summary",
+            "videoThumbnails": [{"quality":"medium", "url":"https://i.ytimg.com/vi/dQw4w9WgXcQ/mqdefault.jpg"}]
+        });
+        let card = parse_invidious(
+            &body,
+            "https://youtu.be/dQw4w9WgXcQ",
+            "https://inv.nadeko.net",
+        )
+        .unwrap();
+        assert_eq!(card.author, "A video");
+        assert_eq!(card.handle, "Creator");
+        assert_eq!(
+            card.image.as_deref(),
+            Some("https://inv.nadeko.net/vi/dQw4w9WgXcQ/mqdefault.jpg")
+        );
+    }
 
     fn rules() -> Vec<EmbedRule> {
         let mut r = default_rules();

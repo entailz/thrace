@@ -14,6 +14,7 @@ use std::sync::Arc;
 mod decode;
 mod dm;
 mod media;
+mod pins;
 mod prefs;
 mod rows;
 mod send;
@@ -60,6 +61,7 @@ pub struct AudioAttachment {
 pub struct TimelineRow {
     pub id: String,
     pub ts: String,
+    pub origin_server_ts: u64,
     pub sender: String,
     pub display_name: String,
     pub body: String,
@@ -83,6 +85,18 @@ pub struct TimelineRow {
     pub edited: bool,
     /// Mxids whose latest `m.read` points here; avatar dots under the message.
     pub seen_by: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PinnedMessage {
+    pub id: String,
+    pub sender: String,
+    pub display_name: String,
+    pub avatar_mxc: Option<String>,
+    pub body: String,
+    pub ts: String,
+    pub origin_server_ts: u64,
+    pub timeline_row: Option<TimelineRow>,
 }
 
 /// One reaction group: emoji key + sender mxids.
@@ -239,6 +253,12 @@ pub struct ThraceApp {
     react_tx: Option<std::sync::mpsc::Sender<(String, RelationResults)>>,
     /// Sidebar room menu: (room id, anchor, frame it opened on).
     room_menu: Option<(String, egui::Pos2, u64)>,
+    /// Open pinned-message list and its room-scoped fetch result.
+    pinned_room: Option<String>,
+    pinned_messages: Vec<PinnedMessage>,
+    pinned_loading: bool,
+    pinned_error: Option<String>,
+    pinned_rx: Option<std::sync::mpsc::Receiver<(String, Result<Vec<PinnedMessage>, String>)>>,
     /// Rooms we have tagged as favourites, for the menu's toggle state.
     favourites: std::collections::HashSet<String>,
     /// Profile card: (mxid, anchor). Opened by clicking an avatar or name in
@@ -732,6 +752,11 @@ impl ThraceApp {
             react_tx: None,
             profile_target: None,
             room_menu: None,
+            pinned_room: None,
+            pinned_messages: Vec::new(),
+            pinned_loading: false,
+            pinned_error: None,
+            pinned_rx: None,
             favourites: std::collections::HashSet::new(),
             send_rx: None,
             send_tx: None,

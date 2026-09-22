@@ -35,29 +35,8 @@ impl ThraceApp {
         name: &str,
         size: f32,
     ) -> egui::Response {
-        // Request near drawn size to avoid upscaled thumbnails.
-        let request = (size.ceil() as u32).max(32);
-        if let Some(uri) = mxc {
-            let kind = if request > 64 { "avatar-lg" } else { "avatar" };
-            if let Some(handle) = self.media.texture_for(kind, uri, Some((request, request))) {
-                return ui.add(
-                    egui::Image::new(&handle)
-                        .max_size(egui::vec2(size, size))
-                        .sense(egui::Sense::click()),
-                );
-            }
-        }
         let (rect, resp) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::click());
-        let col = self.nick_color(name);
-        ui.painter()
-            .rect_filled(rect, size * 0.21, col.gamma_multiply(0.25));
-        ui.painter().text(
-            rect.center(),
-            egui::Align2::CENTER_CENTER,
-            Self::avatar_initial(name),
-            egui::FontId::monospace(size * 0.46),
-            col,
-        );
+        self.paint_avatar_at(ui, rect, mxc, name);
         resp
     }
 
@@ -133,13 +112,17 @@ impl ThraceApp {
                 .media
                 .texture_for("avatar", uri, Some((request, request)))
             {
-                let tint = egui::Color32::WHITE;
-                ui.painter().image(
-                    handle.id(),
-                    rect,
-                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                    tint,
-                );
+                // Fill the square without stretching non-square source images.
+                let [width, height] = handle.size();
+                let uv = if width > height {
+                    let margin = (1.0 - height as f32 / width as f32) * 0.5;
+                    egui::Rect::from_min_max(egui::pos2(margin, 0.0), egui::pos2(1.0 - margin, 1.0))
+                } else {
+                    let margin = (1.0 - width as f32 / height as f32) * 0.5;
+                    egui::Rect::from_min_max(egui::pos2(0.0, margin), egui::pos2(1.0, 1.0 - margin))
+                };
+                ui.painter()
+                    .image(handle.id(), rect, uv, egui::Color32::WHITE);
                 return;
             }
         }

@@ -79,7 +79,7 @@ pub(in crate::app) fn format_ts(millis: Option<u64>) -> String {
 /// The `@word` at the end of `input`. Only the final word counts, so a
 /// mid-sentence completion cannot move the cursor unexpectedly.
 pub(in crate::app) fn mention_prefix(input: &str) -> Option<&str> {
-    let word = input.rsplit(' ').next()?;
+    let word = input.rsplit(char::is_whitespace).next()?;
     if !word.starts_with('@') || word.len() > 64 {
         return None;
     }

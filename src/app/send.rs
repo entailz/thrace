@@ -140,6 +140,7 @@ impl ThraceApp {
                     std::rc::Rc::make_mut(&mut self.rows).push(TimelineRow {
                         id: format!("local-{n}"),
                         ts: format_ts(now_millis()),
+                        origin_server_ts: 0,
                         sender: "system".into(),
                         display_name: "system".into(),
                         body: SLASH_COMMANDS
@@ -166,6 +167,7 @@ impl ThraceApp {
                     std::rc::Rc::make_mut(&mut self.rows).push(TimelineRow {
                         id: format!("local-{n}"),
                         ts: format_ts(now_millis()),
+                        origin_server_ts: 0,
                         sender: "system".into(),
                         display_name: "system".into(),
                         body: format!("Unknown command /{verb} — try /help"),
@@ -357,6 +359,7 @@ impl ThraceApp {
         std::rc::Rc::make_mut(&mut self.rows).push(TimelineRow {
             id: txn.clone(),
             ts: format_ts(now_millis()),
+            origin_server_ts: 0,
             sender: "@you:hs".into(),
             display_name: "you".into(),
             body: format!("▲ {} ({} KB) …", up.name, up.bytes.len() / 1024),
@@ -677,6 +680,7 @@ impl ThraceApp {
         std::rc::Rc::make_mut(&mut self.rows).push(TimelineRow {
             id: format!("local-{n}"),
             ts: format_ts(now_millis()),
+            origin_server_ts: 0,
             sender: "@you:hs".into(),
             display_name: "you".into(),
             body: format!("Sticker :{sc}:"),
@@ -984,6 +988,7 @@ impl ThraceApp {
         std::rc::Rc::make_mut(&mut self.rows).push(TimelineRow {
             id: txn_id.clone().unwrap_or_else(|| format!("local-{n}")),
             ts: format_ts(now_millis()),
+            origin_server_ts: 0,
             sender: sender.into(),
             display_name: display.into(),
             body,

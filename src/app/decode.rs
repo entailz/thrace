@@ -332,6 +332,7 @@ pub(in crate::app) async fn decode_timeline_json(
     TimelineRow {
         id: event_id,
         ts: format_ts(origin_server_ts),
+        origin_server_ts: origin_server_ts.unwrap_or_default(),
         sender: sender.to_owned(),
         display_name: display.to_owned(),
         body: body.to_owned(),
@@ -630,6 +631,7 @@ pub(in crate::app) fn empty_row(body: &str) -> TimelineRow {
     TimelineRow {
         id: "empty".into(),
         ts: format_ts(now_millis()),
+        origin_server_ts: 0,
         sender: "system".into(),
         display_name: "system".into(),
         body: body.into(),
