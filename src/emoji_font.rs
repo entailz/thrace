@@ -105,7 +105,8 @@ impl EmojiFont {
         }
     }
 
-    fn decode(&self, emoji: &str) -> Option<egui::ColorImage> {
+    /// Decode one emoji for non-egui frontends as well.
+    pub(crate) fn decode(&self, emoji: &str) -> Option<egui::ColorImage> {
         if let Some(img) = Self::decode_with(TWEMOJI, emoji) {
             return Some(img);
         }

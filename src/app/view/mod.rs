@@ -907,16 +907,18 @@ impl eframe::App for ThraceApp {
                     egui::vec2(av, av),
                 );
                 self.paint_avatar_at(ui, av_rect, &m.avatar_mxc, &m.display);
-                // Presence dot against the avatar.
-                ui.painter().circle_filled(
-                    egui::pos2(av_rect.right() - 2.0, av_rect.bottom() - 2.0),
-                    3.5,
-                    if m.online {
-                        self.theme.gold()
-                    } else {
-                        ui.visuals().weak_text_color()
-                    },
-                );
+                // Presence dot against the avatar, only when the server reports presence.
+                if let Some(state) = self.presence_of(m) {
+                    ui.painter().circle_filled(
+                        egui::pos2(av_rect.right() - 2.0, av_rect.bottom() - 2.0),
+                        3.5,
+                        if state == "online" {
+                            self.theme.gold()
+                        } else {
+                            ui.visuals().weak_text_color()
+                        },
+                    );
+                }
                 // Reserve the DM button width only while hovered.
                 let text_x = av_rect.right() + 9.0;
                 let reserve = if hovered { 32.0 } else { 6.0 };
@@ -1451,9 +1453,8 @@ impl eframe::App for ThraceApp {
                         let rows = std::rc::Rc::clone(&self.rows);
                         for (ri, row) in rows.iter().enumerate() {
                             let row_id = row.id.clone();
-                            let grouped = row.sender != "system"
-                                && ri > 0
-                                && rows[ri - 1].sender == row.sender;
+                            let grouped =
+                                ri > 0 && crate::app::text::continues_group(&rows[ri - 1], row);
 
                             // Live target row first; plain-text quote fallback when not loaded.
                             let reply_view: Option<(String, String, Option<String>)> = row
@@ -2415,11 +2416,10 @@ impl eframe::App for ThraceApp {
                 // Favourite toggles; resolve current state here, not in the menu.
                 let action = match action {
                     RoomMenuAction::Favourite(_) => {
-                        let on = !self.favourites.contains(&room_id);
-                        if on {
-                            self.favourites.insert(room_id.clone());
-                        } else {
-                            self.favourites.remove(&room_id);
+                        let room = self.rooms.iter_mut().find(|r| r.room_id == room_id);
+                        let on = room.as_ref().is_some_and(|r| !r.meta.favourite);
+                        if let Some(room) = room {
+                            room.meta.favourite = on;
                         }
                         RoomMenuAction::Favourite(on)
                     }

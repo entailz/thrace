@@ -15,6 +15,17 @@ pub struct Config {
     pub theme: String,
     pub font_size: f32,
     pub show_previews: bool,
+    /// Timeline style: "bubble", "modern" or "compact". Only the Slint UI reads it.
+    pub message_layout: String,
+    /// Clock for message times: "24h" or "12h". Only the Slint UI reads it.
+    pub time_format: String,
+    /// Sidebar order: "activity", "unread" (unread first, then activity) or "name".
+    pub room_sort: String,
+    /// Split the sidebar into Favourites / People / Rooms / Low priority.
+    pub group_rooms: bool,
+    /// Bubble colours as "#rrggbb"; empty uses the theme (accent for yours, neutral for others).
+    pub own_bubble_color: String,
+    pub other_bubble_color: String,
     pub embeds: Embeds,
 }
 
@@ -24,6 +35,12 @@ impl Default for Config {
             theme: "dark".into(),
             font_size: 14.0,
             show_previews: true,
+            message_layout: "bubble".into(),
+            time_format: "24h".into(),
+            room_sort: "activity".into(),
+            group_rooms: true,
+            own_bubble_color: String::new(),
+            other_bubble_color: String::new(),
             embeds: Embeds::default(),
         }
     }
@@ -54,6 +71,21 @@ impl Config {
         anyhow::ensure!(
             self.font_size.is_finite() && (10.0..=24.0).contains(&self.font_size),
             "font_size must be between 10 and 24"
+        );
+        anyhow::ensure!(
+            ["bubble", "modern", "compact"].contains(&self.message_layout.as_str()),
+            "unknown message_layout: {}",
+            self.message_layout
+        );
+        anyhow::ensure!(
+            ["24h", "12h"].contains(&self.time_format.as_str()),
+            "unknown time_format: {}",
+            self.time_format
+        );
+        anyhow::ensure!(
+            ["activity", "unread", "name"].contains(&self.room_sort.as_str()),
+            "unknown room_sort: {}",
+            self.room_sort
         );
         Ok(())
     }
@@ -225,6 +257,11 @@ mod tests {
         config.theme = "win98".into();
         config.font_size = 18.0;
         config.show_previews = false;
+        config.message_layout = "compact".into();
+        config.time_format = "12h".into();
+        config.room_sort = "name".into();
+        config.group_rooms = false;
+        config.own_bubble_color = "#8ab4f8".into();
         config.embeds.rules[0].enabled = true;
         config.embeds.rules[0].open_with = "preview.example".into();
         config.embeds.rules[0].api = "https://preview.example/api".into();

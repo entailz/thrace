@@ -1,7 +1,7 @@
 # Thrace
 
-A desktop Matrix client with a compact layout. Written in Rust with egui
-and matrix-sdk.
+A desktop Matrix client with a compact Slint interface. Written in Rust with
+Slint and matrix-sdk.
 
 Rooms, timestamps, colored nicknames, and a compact timeline. Supports
 encrypted chats, device verification, replies, threads, reactions, file
@@ -15,12 +15,15 @@ You need Rust and Cargo. On x86_64 Linux, the build config also expects the
 ```sh
 git clone https://github.com/entailz/thrace.git
 cd thrace
-cargo run --release
+cargo build --release --bin thrace-slint --features="slint-ui"
+cargo run --release --bin thrace-slint --features="slint-ui"
 ```
 
-For toolbar icons, install Symbols Nerd Font. The app looks for
-`SymbolsNerdFont-Regular.ttf` in system font directories and
-`~/.local/share/fonts/`.
+It shares the existing Matrix session, preferences, room history, and sending
+code. The original `thrace` binary remains available as the egui reference
+while the port reaches parity.
+
+Material Symbols Rounded is bundled for toolbar and action icons.
 
 Video playback uses `ffmpeg`, `ffprobe`, and `ffplay`. Make sure they are on
 your `PATH` if you want in-app playback.
@@ -31,7 +34,7 @@ Four themes are included: `dark` (the default), `midnight`, `bbs-amber`,
 and `win98`. Pick one in settings or at startup:
 
 ```sh
-cargo run --release -- --theme midnight
+cargo run --release --bin thrace-slint --features="slint-ui" -- --theme midnight
 ```
 
 Theme definitions live in `themes/` and are compiled into the binary.

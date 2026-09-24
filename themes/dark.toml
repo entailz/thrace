@@ -12,7 +12,7 @@ gold = "#d9a648"
 
 [timeline]
 timestamp = "#7a7a7a"
-nick_colors = ["#7dd3d8", "#8ab4f8", "#c3c3c3", "#d9a648", "#9aa0a6", "#5cc8c0"]
+nick_colors = ["#7dd3d8", "#8ab4f8", "#f28b82", "#d9a648", "#c58af9", "#81c995"]
 bevel_width = 0.0
 
 [font]

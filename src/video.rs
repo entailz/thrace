@@ -34,6 +34,8 @@ pub struct VideoPlayer {
     frames: std::sync::mpsc::Receiver<(egui::ColorImage, f64)>,
     /// Currently displayed frame and its presentation time.
     current: Option<(egui::TextureHandle, f64)>,
+    /// CPU copy used by non-egui frontends such as Slint.
+    current_image: Option<(egui::ColorImage, f64)>,
     /// Next frame, held until its presentation time arrives.
     pending: Option<(egui::ColorImage, f64)>,
     started: f64,
@@ -117,6 +119,7 @@ impl VideoPlayer {
         Ok(Self {
             frames,
             current: None,
+            current_image: None,
             pending: None,
             started: now,
             video,
@@ -157,12 +160,31 @@ impl VideoPlayer {
 
     /// Advance to the frame due at `now`, returning what to draw.
     pub fn frame(&mut self, ctx: &egui::Context, now: f64) -> Option<egui::TextureHandle> {
+        let changed = self.advance(now);
+        if changed {
+            if let Some((image, pts)) = self.current_image.as_ref() {
+                let handle =
+                    ctx.load_texture("video-frame", image.clone(), egui::TextureOptions::LINEAR);
+                self.current = Some((handle, *pts));
+            }
+        }
+        self.current.as_ref().map(|(handle, _)| handle.clone())
+    }
+
+    /// Advance playback and return the current CPU frame for Slint.
+    pub fn frame_image(&mut self, now: f64) -> Option<egui::ColorImage> {
+        self.advance(now);
+        self.current_image.as_ref().map(|(image, _)| image.clone())
+    }
+
+    fn advance(&mut self, now: f64) -> bool {
         // Paused: hold the frame. Not draining the channel is what makes
         // ffmpeg stop too, once its buffer fills.
         if let Some(_position) = self.paused_at {
-            return self.current.as_ref().map(|(h, _)| h.clone());
+            return false;
         }
         let elapsed = now - self.started;
+        let mut changed = false;
         loop {
             // Hold the next frame until its time comes, so playback runs at
             // the clip's rate rather than as fast as it decodes.
@@ -181,10 +203,10 @@ impl VideoPlayer {
                 break;
             }
             let (image, pts) = self.pending.take().expect("checked above");
-            let handle = ctx.load_texture("video-frame", image, egui::TextureOptions::LINEAR);
-            self.current = Some((handle, pts));
+            self.current_image = Some((image, pts));
+            changed = true;
         }
-        self.current.as_ref().map(|(h, _)| h.clone())
+        changed
     }
 
     /// Seconds played so far.

@@ -1,0 +1,516 @@
+import { Theme } from "../theme.slint";
+import { MessageView, ReactionView, MessageBlockView } from "../types.slint";
+import { Avatar, IconButton, MaterialIcon } from "primitives.slint";
+
+// "Today" / "Yesterday" / date label between days, drawn as a badge between two rules.
+export component DayDivider inherits HorizontalLayout {
+    in property <string> label;
+    padding-left: Theme.space-lg;
+    padding-right: Theme.space-lg;
+    padding-top: Theme.space-md;
+    padding-bottom: Theme.space-xs;
+    spacing: Theme.space-sm;
+    cross-axis-alignment: center;
+    Rectangle { height: 1px; background: Theme.border; }
+    Rectangle {
+        width: day-label.preferred-width + 16px;
+        height: day-label.preferred-height + 4px;
+        border-radius: Theme.radius-xs;
+        border-width: 1px;
+        border-color: Theme.border;
+        day-label := Text { text: root.label; color: Theme.muted; font-size: Theme.chat-small; font-weight: 600; }
+    }
+    Rectangle { height: 1px; background: Theme.border; }
+}
+
+// Line above the first message that arrived since the room was last read.
+component UnreadDivider inherits HorizontalLayout {
+    padding-left: Theme.space-lg;
+    padding-right: Theme.space-lg;
+    padding-top: Theme.space-sm;
+    spacing: Theme.space-sm;
+    cross-axis-alignment: center;
+    Rectangle { height: 1px; background: Theme.accent; }
+    Rectangle {
+        width: unread-label.preferred-width + 16px;
+        height: unread-label.preferred-height + 4px;
+        border-radius: Theme.radius-xs;
+        background: Theme.accent;
+        unread-label := Text { text: "New messages"; color: Theme.on-accent; font-size: Theme.chat-small; font-weight: 700; }
+    }
+    Rectangle { height: 1px; background: Theme.accent; }
+}
+
+component ReactionChip inherits Rectangle {
+    in property <ReactionView> reaction;
+    callback clicked;
+    height: max(26px, chip-row.preferred-height + 6px);
+    width: chip-row.preferred-width;
+    border-radius: self.height / 2;
+    background: root.reaction.owned ? Theme.accent.with-alpha(20%) : chip-touch.has-hover ? Theme.selection : Theme.hover;
+    border-width: root.reaction.owned ? 1.5px : 1px;
+    border-color: root.reaction.owned ? Theme.accent : Theme.border;
+    animate background { duration: 120ms; }
+    chip-row := HorizontalLayout {
+        padding-left: Theme.space-sm;
+        padding-right: 10px;
+        spacing: Theme.space-xs;
+        cross-axis-alignment: center;
+        if root.reaction.has-image : Image { width: 16px; height: 16px; source: root.reaction.image; image-fit: contain; }
+        if !root.reaction.has-image : Text { text: root.reaction.display; font-size: Theme.chat-body + 1px; }
+        Text { text: root.reaction.count; color: Theme.text; font-size: Theme.chat-small; font-weight: 600; }
+    }
+    chip-touch := TouchArea { mouse-cursor: pointer; clicked => { root.clicked(); } }
+    // Custom tooltip content is drawn inside Slint's fixed tooltip frame, which doesn't grow
+    // with it, so use the standard text tooltip.
+    property <string> who: root.reaction.reactors == "" ? "Someone" : root.reaction.reactors;
+    Tooltip { text: @markdown("**\{root.who}** reacted with \{root.reaction.display}"); }
+}
+
+component CodeBlock inherits Rectangle {
+    in property <MessageBlockView> block;
+    callback copy(string);
+    height: code-layout.preferred-height;
+    background: Theme.panel;
+    border-radius: Theme.radius-sm;
+    border-width: 1px;
+    border-color: Theme.border;
+    clip: true;
+    code-layout := VerticalLayout {
+        padding: Theme.space-sm;
+        spacing: 2px;
+        HorizontalLayout {
+            cross-axis-alignment: center;
+            Text { text: root.block.language == "" ? "code" : root.block.language; color: Theme.muted; font-size: Theme.chat-small; font-family: "monospace"; horizontal-stretch: 1; }
+            IconButton { width: 26px; height: 26px; icon-size: 16px; glyph: "content_copy"; tooltip: "Copy code"; clicked => { root.copy(root.block.text); } }
+        }
+        for line in root.block.lines : HorizontalLayout {
+            alignment: start;
+            for token in line.tokens : Text {
+                text: token.text;
+                color: token.kind == "keyword" ? #c69bff : token.kind == "string" ? #a3d68f : token.kind == "number" ? #f2be78 : token.kind == "comment" ? Theme.muted : Theme.text;
+                font-size: Theme.chat-small;
+                font-family: "monospace";
+            }
+        }
+    }
+}
+
+// Wrapped message text. The height comes from the text measured at this element's own width:
+// nested inside layouts, StyledText otherwise measures at a stale width and reserves too few
+// lines, so wrapped text spilled into the reactions or was clipped by the bubble.
+component TextBlock inherits Rectangle {
+    in property <styled-text> text;
+    in property <length> font-size;
+    callback link-clicked(string);
+    height: label.preferred-height;
+    label := StyledText {
+        width: parent.width;
+        text: root.text;
+        default-color: Theme.text;
+        link-color: Theme.accent;
+        default-font-size: root.font-size;
+        link-clicked(link) => { root.link-clicked(link); }
+    }
+}
+
+// Everything inside a message: reply quote, text/code blocks, media. Shared by all layouts.
+component MessageBody inherits VerticalLayout {
+    in property <MessageView> message;
+    in property <length> font-size;
+    callback open-reply;
+    callback open-link(string);
+    callback copy-text(string);
+    callback open-media;
+    callback toggle-audio;
+    spacing: Theme.space-xs;
+
+    if root.message.reply != "" : Rectangle {
+        height: reply-row.preferred-height;
+        background: reply-touch.has-hover ? Theme.selection : Theme.bg.with-alpha(35%);
+        border-radius: Theme.radius-xs;
+        animate background { duration: 120ms; easing: ease-out; }
+        Rectangle { x: 0; width: 3px; background: Theme.accent; border-top-left-radius: Theme.radius-xs; border-bottom-left-radius: Theme.radius-xs; }
+        reply-row := HorizontalLayout {
+            padding-left: 10px;
+            padding-right: Theme.space-sm;
+            padding-top: 6px;
+            padding-bottom: 6px;
+            spacing: 6px;
+            cross-axis-alignment: center;
+            Avatar { size: 18px; source: root.message.reply-avatar; has-image: root.message.reply-has-avatar; initial: ""; }
+            Text { text: root.message.reply-sender; color: Theme.accent; font-size: Theme.chat-small; font-weight: 700; horizontal-stretch: 0; }
+            Text { text: root.message.reply-body; color: Theme.muted; font-size: Theme.chat-small; overflow: elide; horizontal-stretch: 1; }
+        }
+        reply-touch := TouchArea { mouse-cursor: pointer; clicked => { root.open-reply(); } }
+    }
+    if !root.message.has-custom-emoji : VerticalLayout {
+        spacing: Theme.space-xs;
+        for block in root.message.blocks : VerticalLayout {
+            if block.kind == "text" : TextBlock {
+                text: block.styled;
+                font-size: root.font-size;
+                link-clicked(link) => { root.open-link(link); }
+            }
+            if block.kind == "code" : CodeBlock { block: block; copy(text) => { root.copy-text(text); } }
+        }
+    }
+    if root.message.has-custom-emoji : Rectangle {
+        width: 48px;
+        height: 48px;
+        Image { width: 40px; height: 40px; source: root.message.custom-emoji; image-fit: contain; }
+        Tooltip { text: @markdown("\{root.message.custom-emoji-name}"); }
+    }
+    if root.message.has-media : Rectangle {
+        width: root.message.sticker ? 140px : 300px;
+        height: root.message.sticker ? 140px : 190px;
+        border-radius: Theme.radius-sm;
+        clip: true;
+        Image { width: parent.width; height: parent.height; source: root.message.media; image-fit: contain; }
+        if root.message.media-kind == "video" : Rectangle {
+            width: 44px;
+            height: 44px;
+            border-radius: 22px;
+            background: #00000099;
+            MaterialIcon { width: parent.width; height: parent.height; glyph: "play_arrow"; color: white; font-size: 26px; }
+        }
+        TouchArea { mouse-cursor: pointer; clicked => { root.open-media(); } }
+    }
+    if root.message.media-kind == "image" && !root.message.has-media : Rectangle {
+        width: 300px;
+        height: 64px;
+        border-radius: Theme.radius-sm;
+        background: Theme.panel;
+        HorizontalLayout {
+            padding-left: Theme.space-md;
+            padding-right: Theme.space-md;
+            spacing: Theme.space-sm;
+            cross-axis-alignment: center;
+            MaterialIcon { glyph: "image"; font-size: 22px; width: 24px; height: 24px; }
+            VerticalLayout {
+                alignment: center;
+                Text { text: root.message.media-label == "" ? "Image" : root.message.media-label; color: Theme.text; font-size: Theme.chat-small; font-weight: 600; overflow: elide; }
+                Text { text: "Loading preview…"; color: Theme.muted; font-size: Theme.chat-small; }
+            }
+        }
+    }
+    if root.message.media-kind == "audio" : Rectangle {
+        min-width: 220px;
+        max-width: 360px;
+        height: 48px;
+        background: Theme.bg.with-alpha(40%);
+        border-radius: Theme.radius-sm;
+        HorizontalLayout {
+            padding-left: Theme.space-sm;
+            padding-right: Theme.space-md;
+            spacing: Theme.space-sm;
+            cross-axis-alignment: center;
+            Rectangle {
+                width: 32px;
+                height: 32px;
+                border-radius: 16px;
+                background: Theme.accent;
+                MaterialIcon { width: parent.width; height: parent.height; glyph: root.message.media-playing ? "pause" : "play_arrow"; color: Theme.on-accent; }
+                TouchArea { mouse-cursor: pointer; clicked => { root.toggle-audio(); } }
+            }
+            VerticalLayout {
+                alignment: center;
+                spacing: Theme.space-xs;
+                HorizontalLayout {
+                    spacing: 6px;
+                    Text { text: root.message.media-label; color: Theme.text; font-size: Theme.chat-small; font-weight: 600; overflow: elide; horizontal-stretch: 1; }
+                    Text { text: root.message.media-state; color: root.message.media-state.starts-with("Failed") ? Theme.danger : Theme.muted; font-size: Theme.chat-small; }
+                }
+                Rectangle {
+                    height: 4px;
+                    background: Theme.bg;
+                    border-radius: 2px;
+                    Rectangle { x: 0; width: parent.width * root.message.media-progress; background: Theme.accent; border-radius: 2px; }
+                }
+            }
+        }
+    }
+    if root.message.media-kind == "video" && !root.message.has-media : Rectangle {
+        width: 240px;
+        height: 120px;
+        background: Theme.panel;
+        border-radius: Theme.radius-sm;
+        VerticalLayout {
+            alignment: center;
+            spacing: Theme.space-xs;
+            MaterialIcon { width: parent.width; height: 32px; glyph: "play_arrow"; color: Theme.text; font-size: 30px; }
+            Text { text: root.message.media-label; color: Theme.muted; font-size: Theme.chat-small; horizontal-alignment: center; overflow: elide; }
+        }
+        TouchArea { mouse-cursor: pointer; clicked => { root.open-media(); } }
+    }
+}
+
+// One timeline event. `message-layout` is "bubble" (default), "modern" or "compact".
+export component MessageRow inherits Rectangle {
+    in property <MessageView> message;
+    in property <string> message-layout: "bubble";
+    in property <bool> highlighted: false;
+    in property <length> font-size: 14px;
+    // Bubble fills; `other-tinted` tints others' bubbles like your own instead of a neutral grey.
+    in property <color> own-bubble: Theme.accent;
+    in property <color> other-bubble: Theme.hover;
+    in property <bool> other-tinted: false;
+    callback reply;
+    callback edit;
+    // Absolute window positions for the popups the window owns.
+    callback react-requested(length, length);
+    callback more-requested(length, length);
+    callback profile-requested(length, length);
+    callback open-reply;
+    callback open-link(string);
+    callback open-card(string);
+    callback copy-text(string);
+    callback toggle-reaction(string);
+    callback open-media;
+    callback toggle-audio;
+
+    // Room for read receipts so bubbles never run under them.
+    property <length> receipts-width: 56px;
+    property <length> avatar-column: root.message-layout == "compact" ? 0px : 36px;
+    property <length> content-width: root.width - 2 * Theme.space-lg - root.avatar-column - Theme.space-md - root.receipts-width;
+    property <bool> bubble: root.message-layout == "bubble";
+    property <bool> show-header: !root.message.grouped && root.message-layout != "compact";
+
+    height: row-layout.preferred-height;
+    background: root.highlighted ? Theme.accent.with-alpha(22%) : message-touch.has-hover ? Theme.hover.with-alpha(50%) : transparent;
+
+    message-touch := TouchArea {
+        double-clicked => { root.reply(); }
+        pointer-event(event) => {
+            if (event.button == PointerEventButton.right && event.kind == PointerEventKind.down) {
+                root.react-requested(self.absolute-position.x + self.mouse-x, self.absolute-position.y + self.mouse-y);
+            }
+        }
+    }
+
+    row-layout := VerticalLayout {
+        if root.message.day-divider != "" : DayDivider { label: root.message.day-divider; }
+        if root.message.unread-marker : UnreadDivider { }
+        HorizontalLayout {
+            padding-left: Theme.space-lg;
+            padding-right: Theme.space-lg;
+            padding-top: root.message.grouped ? 2px : Theme.space-md;
+            padding-bottom: 2px;
+            spacing: Theme.space-md;
+            // Deliberate: avatar top lines up with the sender name, not the row centre.
+            cross-axis-alignment: start;
+
+            if root.message-layout == "compact" : Text {
+                width: 3.4 * root.font-size;
+                text: root.message.time;
+                color: Theme.muted;
+                font-size: Theme.chat-small;
+            }
+            if root.message-layout != "compact" : Rectangle {
+                width: root.avatar-column;
+                height: root.show-header ? 36px : 0px;
+                if root.show-header : Avatar {
+                    size: 36px;
+                    source: root.message.avatar;
+                    has-image: root.message.has-avatar;
+                    initial: root.message.initial;
+                    TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => { root.profile-requested(self.absolute-position.x + 44px, self.absolute-position.y); }
+                    }
+                }
+            }
+
+            VerticalLayout {
+                spacing: Theme.space-xs;
+                horizontal-stretch: 1;
+
+                if root.show-header || root.message-layout == "compact" : HorizontalLayout {
+                    spacing: Theme.space-sm;
+                    cross-axis-alignment: center;
+                    alignment: start;
+                    sender-name := Text {
+                        text: root.message.sender;
+                        color: root.message.sender-color;
+                        font-size: root.bubble ? Theme.chat-label : root.font-size;
+                        font-weight: 700;
+                        overflow: elide;
+                        TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => { root.profile-requested(self.absolute-position.x, self.absolute-position.y + 22px); }
+                        }
+                    }
+                    // Compact already shows the time in its own column.
+                    if root.message-layout == "modern" : Text { text: root.message.time; color: Theme.muted; font-size: Theme.chat-small; }
+                    if root.message.edited && !root.bubble : Text { text: "(edited)"; color: Theme.muted; font-size: Theme.chat-small; }
+                    if root.message.sticker : MaterialIcon { glyph: "sticker"; font-size: 16px; }
+                }
+
+                HorizontalLayout {
+                    alignment: start;
+                    spacing: Theme.space-xs;
+                    if root.bubble : Rectangle {
+                        // Shrink-wrap short messages; wide content (images, code) sets its own floor.
+                        // Wide enough for the body, the time line and the reply quote, capped by the row.
+                        width: min(root.content-width, max(
+                            body-measure.preferred-width,
+                            time-measure.preferred-width,
+                            root.message.reply == "" ? 0px : reply-sender-measure.preferred-width + reply-body-measure.preferred-width + 48px,
+                            root.message.content-width * 1px - 2 * Theme.space-md
+                        ) + 2 * Theme.space-md);
+                        background: root.message.own ? root.own-bubble.with-alpha(16%) : root.other-tinted ? root.other-bubble.with-alpha(16%) : root.other-bubble.with-alpha(60%);
+                        border-radius: Theme.radius-md;
+                        border-top-left-radius: root.message.grouped ? Theme.radius-md : Theme.radius-xs;
+                        border-width: 1px;
+                        border-color: root.message.own ? root.own-bubble.with-alpha(32%) : root.other-tinted ? root.other-bubble.with-alpha(32%) : Theme.border;
+                        clip: true;
+                        body-measure := Text { visible: false; text: root.message.body; font-size: root.font-size; wrap: no-wrap; }
+                        time-measure := Text { visible: false; text: (root.message.edited ? "(edited) " : "") + root.message.time; font-size: Theme.chat-small; }
+                        reply-sender-measure := Text { visible: false; text: root.message.reply-sender; font-size: Theme.chat-small; font-weight: 700; }
+                        reply-body-measure := Text { visible: false; text: root.message.reply-body; font-size: Theme.chat-small; }
+                        VerticalLayout {
+                            padding-left: Theme.space-md;
+                            padding-right: Theme.space-md;
+                            padding-top: Theme.space-sm;
+                            padding-bottom: 6px;
+                            spacing: 2px;
+                            MessageBody {
+                                message: root.message;
+                                font-size: root.font-size;
+                                open-reply => { root.open-reply(); }
+                                open-link(link) => { root.open-link(link); }
+                                copy-text(text) => { root.copy-text(text); }
+                                open-media => { root.open-media(); }
+                                toggle-audio => { root.toggle-audio(); }
+                            }
+                            HorizontalLayout {
+                                alignment: end;
+                                spacing: Theme.space-xs;
+                                if root.message.edited : Text { text: "(edited)"; color: Theme.muted; font-size: Theme.chat-small; }
+                                Text { text: root.message.time; color: Theme.muted; font-size: Theme.chat-small; }
+                            }
+                        }
+                    }
+                    if !root.bubble : MessageBody {
+                        width: root.content-width;
+                        message: root.message;
+                        font-size: root.font-size;
+                        open-reply => { root.open-reply(); }
+                        open-link(link) => { root.open-link(link); }
+                        copy-text(text) => { root.copy-text(text); }
+                        open-media => { root.open-media(); }
+                        toggle-audio => { root.toggle-audio(); }
+                    }
+                    // Read receipts in the right gutter, level with the bottom of the message.
+                    if root.message.receipts.length > 0 : Rectangle {
+                        cross-axis-self-alignment: end;
+                        width: receipt-stack.preferred-width;
+                        height: 20px;
+                        receipt-stack := HorizontalLayout {
+                            spacing: -6px;
+                            for receipt in root.message.receipts : Avatar {
+                                size: 20px;
+                                source: receipt.avatar;
+                                has-image: receipt.has-avatar;
+                                initial: receipt.initial;
+                                border-width: 2px;
+                                border-color: Theme.bg;
+                            }
+                        }
+                        Tooltip { text: @markdown("\{root.message.seen-by}"); }
+                    }
+                }
+
+                if root.message.reactions.length > 0 : FlexboxLayout {
+                    spacing: Theme.space-xs;
+                    for reaction in root.message.reactions : ReactionChip {
+                        reaction: reaction;
+                        clicked => { root.toggle-reaction(reaction.key); }
+                    }
+                }
+
+                for card in root.message.embeds : Rectangle {
+                    width: min(430px, root.content-width);
+                    height: card-layout.preferred-height;
+                    background: Theme.panel;
+                    border-color: Theme.accent.with-alpha(35%);
+                    border-width: 1px;
+                    border-radius: Theme.radius-sm;
+                    clip: true;
+                    card-layout := VerticalLayout {
+                        padding: Theme.space-md;
+                        spacing: Theme.space-sm;
+                        HorizontalLayout {
+                            spacing: Theme.space-sm;
+                            cross-axis-alignment: center;
+                            Avatar { size: 28px; source: card.avatar; has-image: card.has-avatar; initial: ""; }
+                            VerticalLayout {
+                                alignment: center;
+                                Text { text: card.author; color: Theme.text; font-size: Theme.chat-small; font-weight: 700; overflow: elide; }
+                                Text { text: card.handle; color: Theme.accent; font-size: Theme.chat-small; overflow: elide; }
+                            }
+                        }
+                        Rectangle {
+                            height: card-text.preferred-height;
+                            card-text := Text { width: parent.width; text: card.text; color: Theme.text; font-size: Theme.chat-label; wrap: word-wrap; max-lines: card.has-media ? 6 : 10; overflow: elide; }
+                        }
+                        if card.has-media : Rectangle {
+                            height: 145px;
+                            border-radius: Theme.radius-xs;
+                            clip: true;
+                            Image { width: parent.width; height: parent.height; source: card.media; image-fit: cover; }
+                        }
+                    }
+                    TouchArea { mouse-cursor: pointer; clicked => { root.open-card(card.link); } }
+                }
+            }
+        }
+    }
+
+    // Stays visible while the cursor is on the row, the bar or any of its buttons, so moving
+    // toward the buttons never hides it (the buttons' TouchAreas take hover from the row).
+    hover-bar := Rectangle {
+        x: parent.width - self.width - Theme.space-lg;
+        y: (root.message.day-divider != "" ? 38px : 0px) + (root.message.unread-marker ? 28px : 0px) + 2px;
+        width: bar-layout.preferred-width;
+        height: bar-layout.preferred-height;
+        opacity: message-touch.has-hover || bar-touch.has-hover || react-btn.hovering || reply-btn.hovering || edit-btn.hovering || more-btn.hovering ? 1 : 0;
+        visible: self.opacity > 0;
+        animate opacity { duration: 100ms; easing: ease-out; }
+        background: Theme.panel;
+        border-color: Theme.border;
+        border-width: 1px;
+        border-radius: Theme.radius-sm;
+        drop-shadow-blur: 12px;
+        drop-shadow-color: #00000066;
+        drop-shadow-offset-y: 2px;
+        bar-touch := TouchArea { }
+        bar-layout := HorizontalLayout {
+            padding: Theme.space-xs;
+            spacing: 2px;
+            react-btn := IconButton {
+                width: 28px;
+                height: 28px;
+                glyph: "add_reaction";
+                tooltip: "Add reaction";
+                clicked => { root.react-requested(self.absolute-position.x, self.absolute-position.y + 34px); }
+            }
+            reply-btn := IconButton { width: 28px; height: 28px; glyph: "reply"; tooltip: "Reply"; clicked => { root.reply(); } }
+            edit-btn := IconButton {
+                visible: root.message.own;
+                width: root.message.own ? 28px : 0px;
+                height: 28px;
+                glyph: "edit";
+                tooltip: "Edit";
+                clicked => { root.edit(); }
+            }
+            more-btn := IconButton {
+                width: 28px;
+                height: 28px;
+                glyph: "more_horiz";
+                tooltip: "More actions";
+                clicked => { root.more-requested(self.absolute-position.x, self.absolute-position.y + 32px); }
+            }
+        }
+    }
+}

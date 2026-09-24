@@ -1,0 +1,49 @@
+// Design tokens shared by every component. Colours are set from the active theme file by
+// `apply_theme()` in src/app/slint_bridge.rs; the rest are fixed.
+export global Theme {
+    in-out property <color> bg: #111418;
+    in-out property <color> panel: #171d23;
+    in-out property <color> text: #eaf1f5;
+    in-out property <color> muted: #82929f;
+    in-out property <color> selection: #283943;
+    in-out property <color> accent: #71c9c2;
+    in-out property <color> hover: #232e37;
+    in-out property <color> border: #2c3a44;
+    in-out property <color> danger: #ff8585;
+    in-out property <color> success: #64c98a;
+    in-out property <color> warning: #e5b85c;
+
+    // Derived so every theme gets a matching tint without extra palette keys.
+    out property <color> danger-container: root.danger.mix(root.bg, 25%);
+    out property <color> on-danger-container: root.danger.mix(root.text, 40%);
+    out property <color> on-accent: root.bg;
+    out property <color> status-bar: root.bg.darker(20%);
+    out property <color> scrim: #000000e6;
+
+    out property <length> radius-xs: 4px;
+    out property <length> radius-sm: 8px;
+    out property <length> radius-md: 12px;
+    out property <length> radius-lg: 16px;
+    out property <length> radius-pill: 999px;
+
+    out property <length> space-xs: 4px;
+    out property <length> space-sm: 8px;
+    out property <length> space-md: 12px;
+    out property <length> space-lg: 16px;
+    out property <length> space-xl: 24px;
+
+    // Type scale (Cinny/folds) for the app chrome.
+    in-out property <length> font-body: 14px;
+    // Timeline and composer text, scaled by the user's font size setting (set by the bridge).
+    in-out property <length> chat-body: 14px;
+    out property <length> chat-small: root.chat-body * 12 / 14;
+    out property <length> chat-label: root.chat-body * 13 / 14;
+    out property <length> font-small: 12px;
+    out property <length> font-label: 13px;
+    out property <length> font-title: 16px;
+    out property <length> font-heading: 18px;
+
+    // Fixed heights so the sidebar, room and detail headers line up.
+    out property <length> header-height: 54px;
+    out property <length> rail-width: 66px;
+}

@@ -301,7 +301,7 @@ pub async fn list_devices(
     user_id: &matrix_sdk::ruma::OwnedUserId,
 ) -> Result<Vec<DeviceInfo>, String> {
     let enc = client.encryption();
-    let own_user = client.user_id().map(|u| u.to_owned());
+    let current_device = client.device_id().map(|device| device.to_owned());
     let devices = enc
         .get_user_devices(user_id)
         .await
@@ -313,8 +313,7 @@ pub async fn list_devices(
             device_id: device.device_id().to_string(),
             display_name: device.display_name().map(str::to_owned),
             verified: device.is_verified(),
-            is_own: Some(device.user_id())
-                == own_user.as_ref().map(|u| u as &matrix_sdk::ruma::UserId),
+            is_own: is_current_device(current_device.as_deref(), device.device_id()),
         });
     }
     out.sort_by(|a, b| {
@@ -325,8 +324,26 @@ pub async fn list_devices(
     Ok(out)
 }
 
+fn is_current_device(
+    current: Option<&matrix_sdk::ruma::DeviceId>,
+    candidate: &matrix_sdk::ruma::DeviceId,
+) -> bool {
+    current.is_some_and(|current| current == candidate)
+}
+
 #[cfg(test)]
 mod tests {
+    use super::is_current_device;
+
+    #[test]
+    fn only_the_running_matrix_device_is_this_session() {
+        let current: matrix_sdk::ruma::OwnedDeviceId = "CURRENT".into();
+        let other: matrix_sdk::ruma::OwnedDeviceId = "OTHER".into();
+        assert!(is_current_device(Some(&current), &current));
+        assert!(!is_current_device(Some(&current), &other));
+        assert!(!is_current_device(None, &current));
+    }
+
     #[test]
     fn sas_emoji_count_is_seven_per_spec() {
         let n_emojis = 7;

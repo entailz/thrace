@@ -10,12 +10,24 @@ use crate::app::{LoginMsg, RoomNotify, SendResult, ThraceApp};
 use crate::theme::ThemeFile;
 
 impl ThraceApp {
+    /// Whether message times use a 12-hour clock. Only the Slint UI offers the choice.
+    #[cfg(feature = "slint-ui")]
+    pub(in crate::app) fn twelve_hour_clock(&self) -> bool {
+        self.time_format == "12h"
+    }
+
     /// Save client preferences without runtime state.
     pub(in crate::app) fn save_preferences(&mut self) {
         let config = crate::config::Config {
             theme: self.config_theme.clone(),
             font_size: self.settings_font_size,
             show_previews: self.show_previews,
+            message_layout: self.message_layout.clone(),
+            time_format: self.time_format.clone(),
+            room_sort: self.room_sort.clone(),
+            group_rooms: self.group_rooms,
+            own_bubble_color: self.own_bubble_color.clone(),
+            other_bubble_color: self.other_bubble_color.clone(),
             embeds: crate::config::Embeds {
                 rules: self.embed_rules.clone(),
             },

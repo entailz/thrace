@@ -15,6 +15,7 @@ use std::collections::HashMap;
 pub struct PackImage {
     pub shortcode: String,
     pub mxc_url: String,
+    pub is_emoji: bool,
     pub is_sticker: bool,
 }
 
@@ -102,7 +103,9 @@ impl PackStore {
                     .collect()
             })
             .unwrap_or_default();
-        let pack_is_sticker = usage.iter().any(|u| u == "sticker");
+        let pack_has_known_usage = usage.iter().any(|u| u == "emoticon" || u == "sticker");
+        let pack_is_emoji = !pack_has_known_usage || usage.iter().any(|u| u == "emoticon");
+        let pack_is_sticker = !pack_has_known_usage || usage.iter().any(|u| u == "sticker");
         let mut images = Vec::new();
         if let Some(map) = content.get("images").and_then(|v| v.as_object()) {
             for (shortcode, v) in map {
@@ -116,14 +119,20 @@ impl PackStore {
                                 .collect::<Vec<_>>()
                         })
                         .unwrap_or_default();
-                    let is_sticker = if img_usage.is_empty() {
-                        pack_is_sticker
+                    let image_has_known_usage =
+                        img_usage.iter().any(|u| u == "emoticon" || u == "sticker");
+                    let (is_emoji, is_sticker) = if image_has_known_usage {
+                        (
+                            img_usage.iter().any(|u| u == "emoticon"),
+                            img_usage.iter().any(|u| u == "sticker"),
+                        )
                     } else {
-                        img_usage.iter().any(|u| u == "sticker")
+                        (pack_is_emoji, pack_is_sticker)
                     };
                     images.push(PackImage {
                         shortcode: shortcode.clone(),
                         mxc_url: url.to_owned(),
+                        is_emoji,
                         is_sticker,
                     });
                 }
@@ -159,11 +168,29 @@ mod tests {
         assert!(pack
             .images
             .iter()
-            .any(|i| i.shortcode == "dance" && !i.is_sticker));
+            .any(|i| i.shortcode == "dance" && i.is_emoji && !i.is_sticker));
         assert!(pack
             .images
             .iter()
-            .any(|i| i.shortcode == "party" && i.is_sticker));
+            .any(|i| i.shortcode == "party" && !i.is_emoji && i.is_sticker));
+    }
+
+    #[test]
+    fn absent_and_dual_usage_images_appear_in_both_picker_tabs() {
+        let pack = PackStore::decode_state_content(
+            "!r:hs",
+            "",
+            &serde_json::json!({
+                "images": {
+                    "fallback": { "url": "mxc://hs/fallback" },
+                    "both": { "url": "mxc://hs/both", "usage": ["emoticon", "sticker"] }
+                }
+            }),
+        );
+        assert!(pack
+            .images
+            .iter()
+            .all(|image| image.is_emoji && image.is_sticker));
     }
 
     #[test]
@@ -175,6 +202,7 @@ mod tests {
             images: vec![PackImage {
                 shortcode: "x".into(),
                 mxc_url: "mxc://a".into(),
+                is_emoji: true,
                 is_sticker: false,
             }],
         });
@@ -184,6 +212,7 @@ mod tests {
             images: vec![PackImage {
                 shortcode: "x".into(),
                 mxc_url: "mxc://b".into(),
+                is_emoji: true,
                 is_sticker: false,
             }],
         });

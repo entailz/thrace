@@ -235,13 +235,33 @@ pub(in crate::app) fn receipt_target<'a>(
     (last_sent != Some(newest.id.as_str())).then_some(newest.id.as_str())
 }
 
-/// Move one person's read receipt onto `event_id`. Unknown target (they read
-/// newer than paged in): ignored, so no avatar disappears.
-pub(in crate::app) fn seen_in(rows: &mut [TimelineRow], event_id: &str, user_id: &str) -> bool {
-    let Some(target) = rows.iter().position(|r| r.id == event_id) else {
+/// Move one person's read receipt onto `event_id`. A receipt on an event we don't show (a
+/// reaction, an edit) lands on the newest message sent at or before `ts`, like Element; with no
+/// usable stamp it is ignored, so no avatar disappears. Receipts never move backwards.
+pub(in crate::app) fn seen_in(
+    rows: &mut [TimelineRow],
+    event_id: &str,
+    user_id: &str,
+    ts: u64,
+) -> bool {
+    let target = rows.iter().position(|r| r.id == event_id).or_else(|| {
+        (ts > 0)
+            .then(|| {
+                rows.iter()
+                    .rposition(|r| r.origin_server_ts > 0 && r.origin_server_ts <= ts)
+            })
+            .flatten()
+    });
+    let Some(target) = target else {
         return false;
     };
-    // Receipts only move forward.
+    if rows
+        .iter()
+        .position(|r| r.seen_by.iter().any(|u| u == user_id))
+        .is_some_and(|current| current > target)
+    {
+        return false;
+    }
     for (i, row) in rows.iter_mut().enumerate() {
         if i != target {
             row.seen_by.retain(|u| u != user_id);

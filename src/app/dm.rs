@@ -70,13 +70,14 @@ impl ThraceApp {
                             mentioned: false,
                             is_dm: true,
                             avatar_mxc: avatar,
-                            preview: None,
+                            ..Default::default()
                         },
                         vec![Member {
                             display: display.into(),
                             mxid: mxid.into(),
-                            online: true,
                             avatar_mxc: None,
+                            power: 0,
+                            presence: None,
                         }],
                     );
                 }
@@ -101,13 +102,14 @@ impl ThraceApp {
                 mentioned: false,
                 is_dm: true,
                 avatar_mxc: avatar,
-                preview: None,
+                ..Default::default()
             },
             vec![Member {
                 display: display.into(),
                 mxid: mxid.into(),
-                online: true,
                 avatar_mxc: None,
+                power: 0,
+                presence: None,
             }],
         );
         std::rc::Rc::make_mut(&mut self.rows).push(TimelineRow {

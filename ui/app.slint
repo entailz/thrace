@@ -1,0 +1,1157 @@
+import { ListView, TextEdit, LineEdit, Button, ComboBox, CheckBox } from "std-widgets.slint";
+import "../assets/MaterialSymbolsRounded.ttf";
+// Twemoji Mozilla with its twelve ASCII entries (digits, '#', '*') removed and the family renamed.
+// Those entries are empty keycap bases, so dropping them lets ordinary text fall through to the
+// system sans font. Regenerate with fontTools: delete cmap codes < 128, rename name IDs 1/3/4/16/6.
+import "../assets/TwemojiThrace.ttf";
+import { Theme } from "theme.slint";
+import { MaterialIcon, Avatar, Badge, IconButton, CompactButton, PopupMenuItem, SectionLabel, Divider, SwatchRow } from "components/primitives.slint";
+import { MessageRow } from "components/timeline.slint";
+import { Composer } from "components/composer.slint";
+import { DetailPanel } from "components/detail-panel.slint";
+import { RoomSidebar } from "components/room-list.slint";
+import { RoomView, ReceiptView, ReactionView, EmbedView, CodeTokenView, CodeLineView, MessageBlockView, MessageView, MemberView, PinView, EmojiView, PackView, EmbedRuleView, DeviceView, SasEmojiView, EmojiCategoryView, UploadView, CommandView } from "types.slint";
+export * from "types.slint";
+export { Theme }
+
+export component AppWindow inherits Window {
+    title: "Thrace";
+    preferred-width: 1180px;
+    preferred-height: 760px;
+    min-width: 800px;
+    min-height: 600px;
+    background: Theme.bg;
+    // Slint can't add a font to its fallback chain, so emoji would come from whatever the system
+    // picks (often a monochrome font). Leading with Twemoji colours every emoji, including inside
+    // std widgets; everything else falls back to the default sans font.
+    default-font-family: "Twemoji Thrace";
+
+    in property <[RoomView]> rooms;
+    in property <[MessageView]> messages;
+    in property <[MemberView]> members;
+    in property <int> member-total: 0;
+    in property <[MemberView]> mention-results;
+    in property <[PinView]> pins;
+    in property <bool> pins-loading: false;
+    in property <string> pins-error;
+    in property <[EmojiView]> emoji-results;
+    in property <[EmbedRuleView]> embed-rules;
+    in property <[DeviceView]> devices;
+    in property <[SasEmojiView]> sas-emojis;
+    in property <[EmojiCategoryView]> emoji-categories;
+    in property <[EmojiView]> skin-tones;
+    in property <[UploadView]> pending-uploads;
+    in property <[CommandView]> command-results;
+    in property <[PackView]> emoji-packs;
+    in property <[string]> ignored-users;
+    in property <string> room-title: "Thrace";
+    in property <string> current-room-id;
+    in property <bool> current-room-is-dm: false;
+    in property <string> current-dm-peer;
+    in property <int> current-room-pin-count: 0;
+    in property <image> current-room-avatar;
+    in property <bool> current-room-has-avatar: false;
+    in property <string> current-room-initial;
+    in property <string> status: "Not connected";
+    in property <string> login-error;
+    in property <string> account-id;
+    in property <string> account-server;
+    in property <image> account-avatar;
+    in property <bool> account-has-avatar: false;
+    in property <string> account-initial;
+    in property <bool> session-unverified: false;
+    in property <bool> sas-ready: false;
+    in property <string> sas-decimals;
+    in property <bool> incoming-verification: false;
+    in property <string> incoming-verification-user;
+    in-out property <string> display-name;
+    in property <bool> logged-in: false;
+    in property <bool> busy: false;
+    in property <string> composer-context;
+    in-out property <string> composer-text;
+    in-out property <bool> show-pins: false;
+    in-out property <bool> detail-open: true;
+    in-out property <string> homeserver: "https://matrix.org";
+    in-out property <string> username;
+    in-out property <string> password;
+    in-out property <string> theme-name: "dark";
+    in-out property <string> reaction-target;
+    in-out property <string> highlight-id;
+    in property <string> current-room-topic;
+    in property <string> typing-text;
+    // First message after the fully-read marker; empty when the room is read.
+    in property <string> first-unread-id;
+    in-out property <string> room-sort: "activity";
+    in-out property <bool> group-rooms: true;
+    // Chosen bubble colours as "#rrggbb" ("" = theme), and the parsed colours from the bridge.
+    in-out property <string> own-bubble-choice;
+    in-out property <string> other-bubble-choice;
+    in property <color> own-bubble-custom;
+    in property <color> other-bubble-custom;
+    private property <bool> unread-dismissed: false;
+    private property <int> scroll-target: 0;
+    private property <int> scroll-request: 0;
+    in property <bool> history-loading: false;
+    in property <bool> history-paginating: false;
+    in property <bool> history-start: false;
+    in property <bool> history-failed: false;
+    in-out property <string> emoji-query;
+    in-out property <string> picker-tab: "emoji";
+    in-out property <string> emoji-category: "Smileys";
+    in-out property <string> room-filter: "all";
+    in-out property <bool> sidebar-collapsed: false;
+    in-out property <string> settings-tab: "Account";
+    in-out property <string> verify-target;
+    in-out property <string> member-query;
+    in-out property <bool> show-room-previews: true;
+    in-out property <float> ui-font-size: 14;
+    in-out property <string> message-layout: "bubble";
+    in-out property <string> time-format: "24h";
+    in-out property <length> detail-width: 266px;
+    private property <string> action-target;
+    private property <bool> action-own;
+    in-out property <string> profile-name;
+    in property <string> profile-initial;
+    in-out property <string> profile-id;
+    in-out property <image> profile-avatar;
+    in-out property <bool> profile-has-avatar;
+    in-out property <bool> profile-online: false;
+    in-out property <int> profile-shared-rooms: 0;
+    in-out property <bool> profile-is-self: false;
+    private property <length> popup-x: 0px;
+    private property <length> popup-y: 0px;
+    private property <length> profile-x: 0px;
+    private property <length> profile-y: 0px;
+    private property <string> picker-mode: "compose";
+    private property <string> reaction-preview;
+    private property <bool> reaction-own: false;
+    private property <int> missed-count: 0;
+    private property <int> last-message-count: 0;
+    in-out property <image> lightbox-image;
+    in-out property <string> lightbox-title;
+    private property <string> lightbox-id;
+    private property <string> room-menu-id;
+    private property <string> room-menu-name;
+    private property <bool> room-menu-unread: false;
+    private property <string> room-menu-notify;
+    private property <length> room-menu-x;
+    private property <length> room-menu-y;
+    private property <string> emoji-hover-name;
+    private property <string> emoji-hover-pack;
+    private property <image> emoji-hover-image;
+    private property <bool> emoji-hover-has-image: false;
+    private property <int> expanded-pack: -1;
+    in-out property <bool> video-open: false;
+    in property <image> video-frame;
+    in property <bool> video-has-frame: false;
+    in property <bool> video-playing: false;
+    in property <string> video-title;
+    in property <string> video-state;
+
+    callback login(string, string, string);
+    callback login-sso(string);
+    callback select-room(int);
+    callback send-message(string);
+    callback open-pin(string);
+    callback reply-message(string);
+    callback edit-message(string);
+    callback copy-message(string);
+    callback delete-message(string);
+    callback cancel-composer-context();
+    callback react-message(string, string);
+    callback open-message(string);
+    callback logout();
+    callback change-theme(string);
+    callback search-emoji(string, string);
+    callback pick-emoji(string, bool);
+    callback open-attachments();
+    pure callback can-accept-drop(data-transfer) -> bool;
+    callback stage-drop(data-transfer);
+    callback paste-attachment();
+    callback save-display-name(string);
+    callback save-appearance(string, float, bool, string, string);
+    callback save-room-list(string, bool);
+    callback save-bubble-colors(string, string);
+    callback toggle-section(string);
+    callback save-embed-rule(int, bool, string, string, string);
+    callback open-dm(string, string);
+    callback copy-text(string);
+    callback refresh-devices();
+    callback load-devices(string);
+    callback verify-device(string, string);
+    callback confirm-verification(bool);
+    callback accept-verification();
+    callback decline-verification();
+    callback open-link(string);
+    callback open-rich-link(string);
+    callback select-skin-tone(string);
+    callback remove-upload(int);
+    callback set-notification-default(bool, string);
+    callback refresh-ignored();
+    callback unignore-user(string);
+    callback accept-mention(string);
+    callback complete-command(string);
+    callback edit-last-message();
+    callback room-action(string, string);
+    callback load-older();
+    callback retry-history();
+    callback mention-profile(string);
+    callback verify-profile(string);
+    callback show-profile(string, string, image, bool);
+    callback toggle-audio(string);
+    callback play-video(string);
+    callback toggle-video();
+    callback stop-video();
+    callback open-image(string);
+    callback save-image(string);
+    changed incoming-verification => {
+        if (root.incoming-verification) { incoming-popup.show(); } else { incoming-popup.close(); }
+    }
+    changed sas-ready => {
+        if (root.sas-ready) { sas-popup.show(); } else { sas-popup.close(); }
+    }
+    changed video-open => {
+        if (root.video-open) { video-popup.show(); } else { video-popup.close(); }
+    }
+    // Called by the bridge once the profile fields are filled in. A direct call (rather than a
+    // bool property) also reopens the card after it was dismissed by clicking outside.
+    public function show-profile-card() {
+        profile-popup.show();
+    }
+    // Highlight a row and scroll to it. The list only creates rows near the viewport, so this
+    // jumps by the row's share of the list, then the row lines itself up once it exists.
+    // The counter changes on every call, so jumping to the same row twice still scrolls.
+    public function jump-to-message(index: int, id: string) {
+        root.highlight-id = id;
+        root.scroll-target = index;
+        root.scroll-request += 1;
+    }
+    // Clear the highlight after a moment so it reads as a flash and rows scrolled into view
+    // later don't pull the list back to it.
+    Timer {
+        interval: 2500ms;
+        running: root.highlight-id != "";
+        triggered => { root.highlight-id = ""; }
+    }
+    changed current-room-id => {
+        root.unread-dismissed = false;
+        root.last-message-count = 0;
+        root.missed-count = 0;
+    }
+
+    if !root.logged-in : Rectangle {
+        background: Theme.bg;
+        VerticalLayout {
+            alignment: center;
+            cross-axis-alignment: center;
+            spacing: Theme.space-md;
+            Text { text: "THRACE"; color: Theme.text; font-size: 30px; font-weight: 700; }
+            Text { text: "A quieter place for your conversations"; color: Theme.muted; }
+            VerticalLayout {
+                width: 360px;
+                padding-top: Theme.space-md;
+                spacing: Theme.space-sm;
+                LineEdit { text <=> root.homeserver; placeholder-text: "Homeserver"; }
+                LineEdit { text <=> root.username; placeholder-text: "Username"; }
+                LineEdit { text <=> root.password; placeholder-text: "Password"; input-type: InputType.password; }
+                Button {
+                    text: root.busy ? "Connecting…" : "Sign in";
+                    primary: true;
+                    enabled: !root.busy;
+                    clicked => { root.login(root.homeserver, root.username, root.password); }
+                }
+                Button { text: "Continue with SSO"; enabled: !root.busy; clicked => { root.login-sso(root.homeserver); } }
+            }
+            if root.login-error != "" : Text { width: 360px; text: root.login-error; color: Theme.danger; horizontal-alignment: center; wrap: word-wrap; }
+        }
+    }
+
+    if root.logged-in : VerticalLayout {
+        spacing: 0px;
+        HorizontalLayout {
+            spacing: 0px;
+            RoomSidebar {
+                rooms: root.rooms;
+                collapsed <=> root.sidebar-collapsed;
+                room-filter <=> root.room-filter;
+                show-previews: root.show-room-previews;
+                account-name: root.display-name;
+                account-id: root.account-id;
+                account-server: root.account-server;
+                account-avatar: root.account-avatar;
+                account-has-avatar: root.account-has-avatar;
+                account-initial: root.account-initial;
+                select-room(index) => { root.select-room(index); }
+                toggle-section(section) => { root.toggle-section(section); }
+                room-context(room, x, y) => {
+                    root.room-menu-id = room.id;
+                    root.room-menu-name = room.name;
+                    root.room-menu-unread = room.unread > 0;
+                    root.room-menu-notify = room.notify;
+                    root.room-menu-x = x;
+                    root.room-menu-y = y;
+                    room-menu.show();
+                }
+                open-account => { root.settings-tab = "Account"; settings-popup.show(); }
+                open-settings => { settings-popup.show(); root.refresh-devices(); root.refresh-ignored(); }
+                logout => { root.logout(); }
+            }
+            Rectangle { width: 1px; background: Theme.border; }
+            Rectangle {
+                background: Theme.bg;
+                VerticalLayout {
+                    spacing: 0px;
+                    Rectangle {
+                        height: Theme.header-height;
+                        background: Theme.panel;
+                        HorizontalLayout {
+                            padding-left: Theme.space-lg;
+                            padding-right: Theme.space-sm;
+                            spacing: Theme.space-md;
+                            cross-axis-alignment: center;
+                            Avatar { size: 36px; source: root.current-room-avatar; has-image: root.current-room-has-avatar; initial: root.current-room-initial; }
+                            VerticalLayout {
+                                alignment: center;
+                                horizontal-stretch: 1;
+                                Text { text: root.room-title; color: Theme.text; font-size: Theme.font-title; font-weight: 600; overflow: elide; }
+                                if root.current-room-topic != "" || root.member-total > 0 : Text {
+                                    text: root.current-room-topic != "" ? root.current-room-topic : root.member-total + " members";
+                                    color: Theme.muted;
+                                    font-size: Theme.font-small;
+                                    overflow: elide;
+                                    wrap: no-wrap;
+                                    if root.current-room-topic != "" : Tooltip { text: @markdown("\{root.current-room-topic}"); }
+                                }
+                            }
+                            HorizontalLayout {
+                                spacing: Theme.space-xs;
+                                cross-axis-alignment: center;
+                                if root.current-room-is-dm && root.current-dm-peer != "" : IconButton { glyph: "verified_user"; tooltip: "Verify this conversation"; clicked => {
+                                    root.settings-tab = "Sessions";
+                                    settings-popup.show();
+                                    root.verify-profile(root.current-dm-peer);
+                                } }
+                                IconButton { glyph: "shield"; foreground: root.session-unverified ? Theme.danger : Theme.text; tooltip: root.session-unverified ? "Session unverified" : "Security and device verification"; clicked => {
+                                    root.settings-tab = "Sessions";
+                                    settings-popup.show();
+                                    root.refresh-devices();
+                                } }
+                                IconButton { glyph: "group"; tooltip: "Members"; clicked => {
+                                    if (root.detail-open && !root.show-pins) { root.detail-open = false; }
+                                    else { root.show-pins = false; root.detail-open = true; }
+                                } }
+                                IconButton {
+                                    glyph: "push_pin";
+                                    tooltip: root.current-room-pin-count > 0 ? "Pinned messages (" + root.current-room-pin-count + ")" : "Pinned messages";
+                                    clicked => {
+                                        if (root.detail-open && root.show-pins) { root.detail-open = false; }
+                                        else { root.show-pins = true; root.detail-open = true; }
+                                    }
+                                    if root.current-room-pin-count > 0 : Badge {
+                                        x: parent.width - self.width + 2px;
+                                        y: -2px;
+                                        count: root.current-room-pin-count;
+                                        highlight: true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Divider { }
+                    Rectangle {
+                    timeline := ListView {
+                        width: parent.width; height: parent.height;
+                        property <int> current-count: root.messages.length;
+                        property <int> scroll-request: root.scroll-request;
+                        changed scroll-request => {
+                            self.follow-bottom = false;
+                            self.content-y = max(
+                                self.visible-height - self.content-height,
+                                min(0px, self.visible-height / 3 - self.content-height * root.scroll-target / max(1, root.messages.length))
+                            );
+                        }
+                        property <bool> near-bottom: -self.content-y + self.visible-height >= self.content-height - 36px;
+                        property <bool> near-top: self.content-y >= -28px;
+                        property <length> previous-content-height: 0px;
+                        property <bool> preserve-prepend-position: false;
+                        // Row heights are estimates until rows are built, so one jump can stop short
+                        // of the end. Keep snapping to the bottom until the user scrolls away.
+                        property <bool> follow-bottom: false;
+                        function scroll-to-bottom() {
+                            self.follow-bottom = true;
+                            self.content-y = min(0px, self.visible-height - self.content-height);
+                            root.missed-count = 0;
+                        }
+                        changed current-count => {
+                            if (root.last-message-count == 0 || self.near-bottom) {
+                                self.content-y = min(0px, self.visible-height - self.content-height);
+                                root.missed-count = 0;
+                            } else if (self.current-count > root.last-message-count && !root.history-paginating) {
+                                root.missed-count += self.current-count - root.last-message-count;
+                            }
+                            root.last-message-count = self.current-count;
+                        }
+                        changed near-bottom => {
+                            if (self.near-bottom) { root.missed-count = 0; }
+                        }
+                        scrolled => {
+                            if (self.near-bottom) {
+                                root.missed-count = 0;
+                            } else {
+                                self.follow-bottom = false;
+                            }
+                            if (self.near-top && self.content-height > self.visible-height && self.current-count > 0 && !root.history-paginating && !root.history-start) {
+                                self.preserve-prepend-position = true;
+                                root.load-older();
+                            }
+                        }
+                        changed content-height => {
+                            if (self.preserve-prepend-position && self.previous-content-height > 0px && self.content-height > self.previous-content-height) {
+                                self.content-y -= self.content-height - self.previous-content-height;
+                                self.preserve-prepend-position = false;
+                            }
+                            self.previous-content-height = self.content-height;
+                            if (self.follow-bottom) {
+                                self.content-y = min(0px, self.visible-height - self.content-height);
+                            }
+                        }
+                        for message in root.messages : MessageRow {
+                            message: message;
+                            message-layout: root.message-layout;
+                            highlighted: root.highlight-id == message.id;
+                            font-size: root.ui-font-size * 1px;
+                            own-bubble: root.own-bubble-choice == "" ? Theme.accent : root.own-bubble-custom;
+                            other-bubble: root.other-bubble-choice == "" ? Theme.hover : root.other-bubble-custom;
+                            other-tinted: root.other-bubble-choice != "";
+                            // Line up exactly, both when the highlight lands on an existing row and
+                            // when the jump creates the row with the highlight already set.
+                            init => {
+                                if (self.highlighted) { self.align(); }
+                                // The "New messages" line has come into view, so the pill is no longer needed.
+                                if (message.unread-marker) { root.unread-dismissed = true; }
+                            }
+                            changed highlighted => { if (self.highlighted) { self.align(); } }
+                            function align() {
+                                timeline.content-y = max(
+                                    timeline.visible-height - timeline.content-height,
+                                    min(0px, timeline.content-y - (self.absolute-position.y - timeline.absolute-position.y - 54px))
+                                );
+                            }
+                            reply => { root.reply-message(message.id); }
+                            edit => { root.edit-message(message.id); }
+                            react-requested(x, y) => {
+                                root.reaction-target = message.id;
+                                root.reaction-preview = message.sender + " — " + message.body;
+                                root.reaction-own = message.own;
+                                root.picker-mode = "react";
+                                root.emoji-query = "";
+                                root.picker-tab = "emoji";
+                                root.popup-x = x;
+                                root.popup-y = y;
+                                root.search-emoji("", "emoji");
+                                emoji-popup.show();
+                            }
+                            more-requested(x, y) => {
+                                root.action-target = message.id;
+                                root.action-own = message.own;
+                                root.popup-x = x - 120px;
+                                root.popup-y = max(52px, y);
+                                action-popup.show();
+                            }
+                            profile-requested(x, y) => {
+                                root.profile-x = x;
+                                root.profile-y = y;
+                                root.show-profile(message.sender-id, message.sender, message.avatar, message.has-avatar);
+                            }
+                            open-reply => { root.open-message(message.reply-id); }
+                            open-link(link) => { root.open-rich-link(link); }
+                            open-card(link) => { root.open-link(link); }
+                            copy-text(text) => { root.copy-text(text); }
+                            toggle-reaction(key) => { root.react-message(message.id, key); }
+                            toggle-audio => { root.toggle-audio(message.id); }
+                            open-media => {
+                                if (message.media-kind == "video") {
+                                    root.video-open = true;
+                                    root.play-video(message.id);
+                                } else {
+                                    root.lightbox-image = message.media;
+                                    root.lightbox-title = message.media-label;
+                                    root.lightbox-id = message.id;
+                                    root.open-image(message.id);
+                                    lightbox.show();
+                                }
+                            }
+                        }
+                    }
+                    // Overlay pills; Slint centres them horizontally since only y is set.
+                    if root.history-loading || root.history-paginating || root.history-start || root.history-failed : Rectangle {
+                        y: Theme.space-sm;
+                        width: history-pill.preferred-width;
+                        height: 28px;
+                        border-radius: self.height / 2;
+                        background: Theme.panel;
+                        border-color: Theme.border;
+                        border-width: 1px;
+                        history-pill := HorizontalLayout {
+                            padding-left: Theme.space-md;
+                            padding-right: Theme.space-md;
+                            spacing: 6px;
+                            cross-axis-alignment: center;
+                            MaterialIcon { glyph: root.history-failed ? "error" : root.history-start ? "vertical_align_top" : "progress_activity"; color: root.history-failed ? Theme.danger : Theme.muted; font-size: 16px; }
+                            Text { text: root.history-failed ? "History failed · click to retry" : root.history-start ? "Beginning of the room" : root.history-paginating ? "Loading older messages…" : "Loading messages…"; color: root.history-failed ? Theme.danger : Theme.muted; font-size: Theme.font-small; }
+                        }
+                        if root.history-failed : TouchArea { mouse-cursor: pointer; clicked => { root.retry-history(); } }
+                    }
+                    if root.first-unread-id != "" && !root.unread-dismissed : Rectangle {
+                        y: root.history-loading || root.history-paginating || root.history-start || root.history-failed ? 44px : Theme.space-sm;
+                        width: unread-pill.preferred-width;
+                        height: 30px;
+                        border-radius: self.height / 2;
+                        background: Theme.panel;
+                        border-color: Theme.accent;
+                        border-width: 1px;
+                        drop-shadow-blur: 8px;
+                        drop-shadow-color: #00000066;
+                        unread-pill := HorizontalLayout {
+                            padding-left: Theme.space-md;
+                            padding-right: 2px;
+                            spacing: Theme.space-xs;
+                            cross-axis-alignment: center;
+                            Rectangle {
+                                width: jump-label.preferred-width + 20px;
+                                height: 26px;
+                                jump-label := HorizontalLayout {
+                                    spacing: 6px;
+                                    cross-axis-alignment: center;
+                                    MaterialIcon { glyph: "arrow_upward"; color: Theme.accent; font-size: 16px; }
+                                    Text { text: "Jump to unread"; color: Theme.text; font-size: Theme.font-small; font-weight: 600; }
+                                }
+                                TouchArea { mouse-cursor: pointer; clicked => { root.open-message(root.first-unread-id); root.unread-dismissed = true; } }
+                            }
+                            IconButton { width: 26px; height: 26px; icon-size: 16px; glyph: "close"; tooltip: "Dismiss"; clicked => { root.unread-dismissed = true; } }
+                        }
+                    }
+                    if root.typing-text != "" : Rectangle {
+                        y: parent.height - self.height;
+                        height: 24px;
+                        background: Theme.bg.with-alpha(90%);
+                        HorizontalLayout {
+                            padding-left: Theme.space-lg;
+                            spacing: Theme.space-sm;
+                            cross-axis-alignment: center;
+                            MaterialIcon { glyph: "more_horiz"; color: Theme.accent; font-size: 16px; }
+                            Text { text: root.typing-text; color: Theme.muted; font-size: Theme.font-small; overflow: elide; }
+                        }
+                    }
+                    // Shown whenever the view is away from the newest messages, not only when new ones arrive.
+                    if root.missed-count > 0 || !timeline.near-bottom : Rectangle {
+                        y: parent.height - self.height - Theme.space-md - (root.typing-text != "" ? 24px : 0px);
+                        width: jump-pill.preferred-width;
+                        height: 30px;
+                        border-radius: self.height / 2;
+                        background: jump-touch.has-hover ? Theme.accent.brighter(10%) : Theme.accent;
+                        drop-shadow-blur: 8px;
+                        drop-shadow-color: #00000088;
+                        drop-shadow-offset-y: 2px;
+                        jump-pill := HorizontalLayout {
+                            padding-left: Theme.space-md;
+                            padding-right: Theme.space-md;
+                            spacing: 6px;
+                            cross-axis-alignment: center;
+                            MaterialIcon { glyph: "arrow_downward"; color: Theme.on-accent; font-size: 16px; }
+                            Text {
+                                text: root.missed-count == 0 ? "Jump to latest" : root.missed-count + (root.missed-count == 1 ? " new message" : " new messages");
+                                color: Theme.on-accent;
+                                font-size: Theme.font-small;
+                                font-weight: 700;
+                            }
+                        }
+                        jump-touch := TouchArea { mouse-cursor: pointer; clicked => { timeline.scroll-to-bottom(); } }
+                    }
+                    }
+                    Composer {
+                        room-title: root.room-title;
+                        context: root.composer-context;
+                        session-unverified: root.session-unverified;
+                        uploads: root.pending-uploads;
+                        mentions: root.mention-results;
+                        commands: root.command-results;
+                        text <=> root.composer-text;
+                        send(text) => { root.send-message(text); }
+                        cancel-context => { root.cancel-composer-context(); }
+                        edit-last => { root.edit-last-message(); }
+                        accept-mention(id) => { root.accept-mention(id); }
+                        complete-command(command) => { root.complete-command(command); }
+                        remove-upload(index) => { root.remove-upload(index); }
+                        attach => { root.open-attachments(); }
+                        paste => { root.paste-attachment(); }
+                        open-emoji => {
+                            root.picker-mode = "compose";
+                            root.picker-tab = "emoji";
+                            root.emoji-query = "";
+                            root.search-emoji("", "emoji");
+                            emoji-popup.show();
+                        }
+                        verify-session => { root.settings-tab = "Sessions"; settings-popup.show(); root.refresh-devices(); }
+                    }
+                }
+            }
+            if root.detail-open : Rectangle { width: 1px; background: Theme.border; }
+            if root.detail-open : DetailPanel {
+                width: self.panel-width;
+                panel-width <=> root.detail-width;
+                show-pins: root.show-pins;
+                pins: root.pins;
+                pins-loading: root.pins-loading;
+                pins-error: root.pins-error;
+                members: root.members;
+                member-total: root.member-total;
+                member-query <=> root.member-query;
+                close => { root.detail-open = false; }
+                open-pin(id) => { root.open-pin(id); }
+                member-clicked(member, x, y) => {
+                    root.profile-x = x - 308px;
+                    root.profile-y = y;
+                    root.show-profile(member.id, member.name, member.avatar, member.has-avatar);
+                }
+            }
+        }
+        Rectangle {
+            height: 24px;
+            background: Theme.status-bar;
+            Text { x: Theme.space-md; text: root.status; color: Theme.muted; font-size: Theme.font-small; }
+        }
+    }
+
+    file-drop := DropArea {
+        enabled: root.logged-in;
+        can-drop(event) => { root.can-accept-drop(event.data) ? DragAction.copy : DragAction.none }
+        dropped(event) => {
+            root.stage-drop(event.data);
+            return DragAction.copy;
+        }
+    }
+    if file-drop.has-drag : Rectangle {
+        x: 12px; y: 12px; width: root.width - 24px; height: root.height - 24px;
+        background: Theme.accent.with-alpha(12%);
+        border-color: Theme.accent; border-width: 2px; border-radius: 12px;
+        MaterialIcon { y: parent.height / 2 - 38px; width: parent.width; height: 34px; glyph: "upload_file"; color: Theme.accent; font-size: 30px; }
+        Text { y: parent.height / 2; width: parent.width; text: "Drop files to attach"; color: Theme.text; font-size: 16px; font-weight: 700; horizontal-alignment: center; }
+    }
+
+    action-popup := PopupWindow {
+        x: max(8px, min(root.width - self.width - 8px, root.popup-x));
+        y: max(8px, min(root.height - self.height - 8px, root.popup-y));
+        width: 200px;
+        height: action-menu.preferred-height;
+        close-policy: close-on-click-outside;
+        Rectangle {
+            background: Theme.panel;
+            border-color: Theme.border;
+            border-width: 1px;
+            border-radius: Theme.radius-sm;
+            drop-shadow-blur: 12px;
+            drop-shadow-color: #00000066;
+            action-menu := VerticalLayout {
+                padding: Theme.space-xs;
+                spacing: 2px;
+                if root.action-own : PopupMenuItem { glyph: "edit"; label: "Edit message"; clicked => { root.edit-message(root.action-target); action-popup.close(); } }
+                PopupMenuItem { glyph: "reply"; label: "Reply"; clicked => { root.reply-message(root.action-target); action-popup.close(); } }
+                PopupMenuItem { glyph: "content_copy"; label: "Copy text"; clicked => { root.copy-message(root.action-target); action-popup.close(); } }
+                if root.action-own : PopupMenuItem { glyph: "delete"; label: "Delete message"; destructive: true; clicked => { root.delete-message(root.action-target); action-popup.close(); } }
+            }
+        }
+    }
+
+    room-menu := PopupWindow {
+        x: max(8px, min(root.width - self.width - 8px, root.room-menu-x));
+        y: max(8px, min(root.height - self.height - 8px, root.room-menu-y));
+        width: 220px;
+        height: room-menu-layout.preferred-height;
+        close-policy: close-on-click-outside;
+        Rectangle { background: Theme.panel; border-color: Theme.border; border-width: 1px; border-radius: Theme.radius-sm;
+            drop-shadow-blur: 12px; drop-shadow-color: #00000066;
+            room-menu-layout := VerticalLayout { padding: Theme.space-xs; spacing: 2px;
+                Text { height: 28px; vertical-alignment: center; text: root.room-menu-name; color: Theme.text; font-size: Theme.font-label; font-weight: 700; overflow: elide; }
+                Divider { }
+                PopupMenuItem { glyph: root.room-menu-unread ? "done" : "mark_chat_unread"; label: root.room-menu-unread ? "Mark as read" : "Mark as unread"; clicked => { root.room-action(root.room-menu-id, root.room-menu-unread ? "read" : "unread"); room-menu.close(); } }
+                PopupMenuItem { glyph: "star"; label: "Toggle favourite"; clicked => { root.room-action(root.room-menu-id, "favourite"); room-menu.close(); } }
+                SectionLabel { text: "NOTIFICATIONS"; height: 24px; vertical-alignment: center; }
+                PopupMenuItem { glyph: "notifications"; label: "All messages"; checked: root.room-menu-notify == "all"; clicked => { root.room-action(root.room-menu-id, "notify-all"); room-menu.close(); } }
+                PopupMenuItem { glyph: "notification_important"; label: "Mentions only"; checked: root.room-menu-notify == "mentions"; clicked => { root.room-action(root.room-menu-id, "notify-mentions"); room-menu.close(); } }
+                PopupMenuItem { glyph: "notifications_off"; label: "Mute"; checked: root.room-menu-notify == "mute"; clicked => { root.room-action(root.room-menu-id, "notify-mute"); room-menu.close(); } }
+                Divider { }
+                PopupMenuItem { glyph: "person_add"; label: "Invite someone"; clicked => { root.room-action(root.room-menu-id, "invite"); room-menu.close(); } }
+                PopupMenuItem { glyph: "content_copy"; label: "Copy room link"; clicked => { root.room-action(root.room-menu-id, "copy"); room-menu.close(); } }
+                PopupMenuItem { glyph: "logout"; label: "Leave room"; destructive: true; clicked => { root.room-action(root.room-menu-id, "leave"); room-menu.close(); } }
+            }
+        }
+    }
+
+    lightbox := PopupWindow {
+        x: 0px; y: 0px; width: root.width; height: root.height;
+        Rectangle {
+            background: Theme.scrim;
+            TouchArea { clicked => { lightbox.close(); } }
+            Image {
+                x: 36px; y: 52px; width: parent.width - 72px; height: parent.height - 88px;
+                source: root.lightbox-image; image-fit: contain;
+            }
+            Text { x: 18px; y: 14px; width: parent.width - 120px; height: 28px; text: root.lightbox-title; color: white; font-size: Theme.font-small; font-weight: 700; vertical-alignment: center; overflow: elide; }
+            Rectangle { x: parent.width - 88px; y: 12px; width: 36px; height: 36px; border-radius: 18px; background: save-lightbox.has-hover ? #ffffff2a : #00000088;
+                MaterialIcon { glyph: "download"; color: white; width: parent.width; height: parent.height; }
+                save-lightbox := TouchArea { mouse-cursor: pointer; clicked => { root.save-image(root.lightbox-id); } }
+            }
+            Rectangle {
+                x: parent.width - 48px; y: 12px; width: 36px; height: 36px;
+                border-radius: 18px; background: close-lightbox.has-hover ? #ffffff2a : #00000088;
+                MaterialIcon { glyph: "close"; color: white; width: parent.width; height: parent.height; }
+                close-lightbox := TouchArea { mouse-cursor: pointer; clicked => { lightbox.close(); } }
+            }
+        }
+    }
+
+    video-popup := PopupWindow {
+        x: 18px; y: 18px; width: root.width - 36px; height: root.height - 36px;
+        close-policy: no-auto-close;
+        Rectangle { background: #090b0dee; border-color: Theme.selection; border-width: 1px; border-radius: 9px;
+            VerticalLayout { padding: 10px; spacing: 7px;
+                HorizontalLayout { height: 30px; spacing: 7px;
+                    Text { text: root.video-title; color: Theme.text; font-size: Theme.font-small; font-weight: 700; vertical-alignment: center; overflow: elide; }
+                    Rectangle { background: transparent; }
+                    Text { text: root.video-state; color: Theme.muted; font-size: Theme.font-small; vertical-alignment: center; }
+                    IconButton { glyph: "close"; tooltip: "Close video"; clicked => { root.video-open = false; root.stop-video(); } }
+                }
+                Rectangle { background: black; border-radius: 5px; clip: true;
+                    if root.video-has-frame : Image { source: root.video-frame; image-fit: contain; width: parent.width; height: parent.height; }
+                    if !root.video-has-frame : MaterialIcon { glyph: "play_arrow"; color: Theme.muted; font-size: 42px; width: parent.width; height: parent.height; }
+                }
+                HorizontalLayout { height: 34px; spacing: 7px; alignment: center;
+                    IconButton { glyph: root.video-playing ? "pause" : "play_arrow"; clicked => { root.toggle-video(); } }
+                    Text { text: root.video-playing ? "Pause" : "Play"; color: Theme.text; font-size: Theme.font-small; vertical-alignment: center; }
+                }
+            }
+        }
+    }
+
+    emoji-popup := PopupWindow {
+        x: max(8px, min(root.width - 388px, root.picker-mode == "react" ? root.popup-x - 180px : root.width / 2 - 190px));
+        y: root.picker-mode == "react" ? max(8px, min(root.height - self.height - 8px, root.popup-y)) : max(8px, root.height - self.height - 8px);
+        width: 380px; height: root.picker-mode == "react" ? 438px : 360px; close-policy: close-on-click-outside;
+        Rectangle { background: Theme.panel; border-color: Theme.selection; border-width: 1px; border-radius: 10px;
+            VerticalLayout { padding: 9px; spacing: 7px;
+                if root.picker-mode == "react" : VerticalLayout { height: 71px; spacing: 5px;
+                    Text { height: 17px; text: "Reacting to  " + root.reaction-preview; color: Theme.muted; font-size: Theme.font-small; font-weight: 600; overflow: elide; }
+                    HorizontalLayout { cross-axis-alignment: center; spacing: 3px;
+                        IconButton { glyph: "reply"; tooltip: "Reply"; clicked => { root.reply-message(root.reaction-target); emoji-popup.close(); } }
+                        IconButton { glyph: "content_copy"; tooltip: "Copy text"; clicked => { root.copy-message(root.reaction-target); emoji-popup.close(); } }
+                        IconButton { visible: root.reaction-own; glyph: "delete"; foreground: Theme.danger; tooltip: "Delete message"; clicked => { root.delete-message(root.reaction-target); emoji-popup.close(); } }
+                        Rectangle { width: 1px; height: 20px; background: Theme.selection; }
+                        for quick in ["👍", "❤️", "😂", "🎉", "👀", "😢"] : Rectangle {
+                            width: 28px; height: 28px; border-radius: 6px; background: quick-touch.has-hover ? Theme.selection : transparent;
+                            Text { text: quick; font-size: 18px; horizontal-alignment: center; vertical-alignment: center; }
+                            quick-touch := TouchArea { mouse-cursor: pointer; clicked => {
+                                root.pick-emoji(quick, false);
+                                root.react-message(root.reaction-target, quick);
+                                emoji-popup.close();
+                            } }
+                        }
+                        Rectangle { background: transparent; }
+                    }
+                    Rectangle { height: 1px; background: Theme.selection; }
+                }
+                HorizontalLayout { cross-axis-alignment: center; spacing: 5px;
+                    CompactButton { text: "Emoji"; checked: root.picker-tab == "emoji"; clicked => { root.picker-tab = "emoji"; root.search-emoji(root.emoji-query, "emoji"); } }
+                    CompactButton { text: "Custom"; checked: root.picker-tab == "custom"; clicked => { root.picker-tab = "custom"; root.search-emoji(root.emoji-query, "custom"); } }
+                    CompactButton { text: "Stickers"; checked: root.picker-tab == "stickers"; clicked => { root.picker-tab = "stickers"; root.search-emoji(root.emoji-query, "stickers"); } }
+                }
+                LineEdit {
+                    height: 34px;
+                    text <=> root.emoji-query; placeholder-text: "Search emoji and shortcodes…";
+                    edited => { root.search-emoji(self.text, root.picker-tab); }
+                }
+                if root.picker-tab == "emoji" : HorizontalLayout { cross-axis-alignment: center; spacing: 3px;
+                    Text { text: "Skin tone"; color: Theme.muted; font-size: Theme.font-small; vertical-alignment: center; }
+                    for tone in root.skin-tones : Rectangle {
+                        width: 27px; height: 27px; border-radius: 5px; background: tone-touch.has-hover ? Theme.selection : transparent;
+                        if tone.has-image : Image { width: 21px; height: 21px; source: tone.image; image-fit: contain; }
+                        if !tone.has-image : Text { text: tone.name; font-size: 17px; horizontal-alignment: center; vertical-alignment: center; }
+                        tone-touch := TouchArea { clicked => { root.select-skin-tone(tone.value); root.search-emoji(root.emoji-query, root.picker-tab); } }
+                    }
+                    Rectangle { background: transparent; }
+                }
+                HorizontalLayout { spacing: 5px;
+                    if root.picker-tab == "emoji" : Rectangle {
+                        width: 40px; background: transparent;
+                        ListView {
+                            vertical-scrollbar-policy: ScrollBarPolicy.always-off;
+                            for category in root.emoji-categories : Rectangle {
+                                height: 38px; border-radius: 7px;
+                                background: root.emoji-category == category.name ? Theme.selection : category-touch.has-hover ? Theme.selection.darker(25%) : transparent;
+                                if category.has-image : Image { width: 22px; height: 22px; source: category.image; image-fit: contain; }
+                                if !category.has-image : Text { text: category.symbol; font-size: 17px; horizontal-alignment: center; vertical-alignment: center; }
+                                category-touch := TouchArea { clicked => { root.emoji-category = category.name; root.search-emoji(root.emoji-query, root.picker-tab); } }
+                                Tooltip { text: @markdown("\{category.name}"); }
+                            }
+                        }
+                    }
+                    emoji-grid := Flickable {
+                        property <int> columns: root.picker-tab == "emoji" ? 7 : 8;
+                        content-height: ((root.emoji-results.length + self.columns - 1) / self.columns) * 42px;
+                        GridLayout { spacing: 2px;
+                    for emoji[index] in root.emoji-results : Rectangle {
+                        row: index / emoji-grid.columns; col: Math.mod(index, emoji-grid.columns); width: 42px; height: 40px; border-radius: 6px;
+                        background: pick-touch.has-hover ? Theme.selection : transparent;
+                        if emoji.has-image : Image { source: emoji.image; image-fit: contain; width: 30px; height: 30px; }
+                        if !emoji.has-image : Text { text: emoji.value; font-size: 23px; vertical-alignment: center; horizontal-alignment: center; }
+                        pick-touch := TouchArea {
+                            mouse-cursor: pointer;
+                            changed has-hover => {
+                                if (self.has-hover) {
+                                    root.emoji-hover-name = emoji.custom ? ":" + emoji.name + ":" : emoji.name;
+                                    root.emoji-hover-pack = emoji.pack;
+                                    root.emoji-hover-image = emoji.image;
+                                    root.emoji-hover-has-image = emoji.has-image;
+                                }
+                            }
+                            clicked => {
+                                if (root.picker-mode == "react") {
+                                    root.pick-emoji(emoji.value, false);
+                                    root.react-message(root.reaction-target, emoji.value);
+                                } else {
+                                    root.pick-emoji(emoji.value, emoji.sticker);
+                                    if (!emoji.sticker) { root.composer-text += emoji.value; }
+                                }
+                                emoji-popup.close();
+                            }
+                        }
+                    }
+                    }
+                    }
+                }
+                Text { text: root.emoji-results.length == 0 ? "No matching emoji" : ""; color: Theme.muted; horizontal-alignment: center; }
+                Rectangle { height: 32px; background: Theme.bg; border-radius: 5px;
+                    HorizontalLayout { padding-left: 6px; padding-right: 6px; spacing: 7px; cross-axis-alignment: center;
+                        if root.emoji-hover-has-image : Image { source: root.emoji-hover-image; image-fit: contain; width: 24px; height: 24px; }
+                        VerticalLayout { alignment: center; spacing: 0px;
+                            Text { text: root.emoji-hover-name == "" ? "Hover an emoji" : root.emoji-hover-name; color: Theme.text; font-size: Theme.font-small; font-weight: 600; overflow: elide; }
+                            Text { visible: root.emoji-hover-pack != ""; text: root.emoji-hover-pack; color: Theme.muted; font-size: Theme.font-small; overflow: elide; }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    settings-popup := PopupWindow {
+        x: root.width / 2 - 380px; y: root.height / 2 - 280px;
+        width: 760px; height: 560px; close-policy: close-on-click-outside;
+        Rectangle { background: Theme.bg; border-color: Theme.selection; border-width: 1px; border-radius: 11px;
+            HorizontalLayout { spacing: 0px;
+                Rectangle { width: 190px; background: Theme.panel;
+                    VerticalLayout { padding: 8px; spacing: 3px;
+                        Text { text: "Settings"; color: Theme.muted; font-size: Theme.font-small; font-weight: 700; }
+                        for tab in ["Account", "Appearance", "Notifications", "Sessions", "Security", "Emoji", "Links"] : Rectangle {
+                            height: 34px; border-radius: 6px; background: root.settings-tab == tab ? Theme.selection : tab-touch.has-hover ? Theme.selection.darker(30%) : transparent;
+                            HorizontalLayout { padding-left: 8px; spacing: 7px; cross-axis-alignment: center;
+                                MaterialIcon { glyph: tab == "Account" ? "person" : tab == "Appearance" ? "palette" : tab == "Notifications" ? "notifications" : tab == "Sessions" ? "devices" : tab == "Security" ? "shield_lock" : tab == "Emoji" ? "emoji_emotions" : "link"; color: Theme.muted; }
+                                Text { text: tab == "Security" ? "Security & Privacy" : tab == "Emoji" ? "Emoji & Stickers" : tab == "Links" ? "Link previews" : tab; color: Theme.text; vertical-alignment: center; font-size: Theme.font-small; }
+                            }
+                            tab-touch := TouchArea { clicked => { root.settings-tab = tab; } }
+                        }
+                        Rectangle { background: transparent; }
+                        HorizontalLayout { cross-axis-alignment: center; spacing: 6px;
+                            IconButton { glyph: "logout"; clicked => { settings-popup.close(); root.logout(); } }
+                            Text { text: "Sign out"; color: Theme.text; font-size: Theme.font-small; vertical-alignment: center; }
+                            Rectangle { background: transparent; }
+                        }
+                    }
+                }
+                Rectangle { background: Theme.bg;
+                    VerticalLayout { padding: 14px; spacing: 8px;
+                        HorizontalLayout {
+                            cross-axis-alignment: center;
+                            Text { text: root.settings-tab; color: Theme.text; font-size: 20px; font-weight: 700; }
+                            Rectangle { background: transparent; }
+                            IconButton { glyph: "close"; clicked => { settings-popup.close(); } }
+                        }
+                        if root.settings-tab == "Account" : VerticalLayout { spacing: 9px;
+                            HorizontalLayout { cross-axis-alignment: center; spacing: 10px;
+                                Avatar { size: 52px; source: root.account-avatar; has-image: root.account-has-avatar; initial: root.account-initial; }
+                                VerticalLayout { alignment: center; spacing: 2px;
+                                    Text { text: root.account-id; color: Theme.text; font-size: Theme.font-label; font-weight: 700; }
+                                    Text { text: root.account-server; color: Theme.muted; font-size: Theme.font-small; }
+                                }
+                            }
+                            Text { text: "Display name"; color: Theme.muted; font-size: Theme.font-small; }
+                            HorizontalLayout { cross-axis-alignment: center; spacing: 7px;
+                                LineEdit { text <=> root.display-name; }
+                                CompactButton { text: "Save"; clicked => { root.save-display-name(root.display-name); } }
+                            }
+                            Text { text: "Password and account recovery are managed by your homeserver."; color: Theme.muted; font-size: Theme.font-small; wrap: word-wrap; }
+                        }
+                        if root.settings-tab == "Appearance" : VerticalLayout { spacing: 10px;
+                            Text { text: "Theme"; color: Theme.muted; font-size: Theme.font-small; }
+                            ComboBox { model: ["dark", "midnight", "bbs-amber", "win98"]; current-value <=> root.theme-name; selected(value) => { root.change-theme(value); } }
+                            Text { text: "Interface font size  " + root.ui-font-size; color: Theme.muted; font-size: Theme.font-small; }
+                            HorizontalLayout { cross-axis-alignment: center; spacing: 5px;
+                                IconButton { glyph: "text_decrease"; clicked => { root.ui-font-size = max(10, root.ui-font-size - 1); root.save-appearance(root.theme-name, root.ui-font-size, root.show-room-previews, root.message-layout, root.time-format); } }
+                                IconButton { glyph: "text_increase"; clicked => { root.ui-font-size = min(24, root.ui-font-size + 1); root.save-appearance(root.theme-name, root.ui-font-size, root.show-room-previews, root.message-layout, root.time-format); } }
+                                Rectangle { background: transparent; }
+                            }
+                            Text { text: "Message layout (modern and compact have no bubbles)"; color: Theme.muted; font-size: Theme.font-small; }
+                            ComboBox {
+                                model: ["bubble", "modern", "compact"];
+                                current-value <=> root.message-layout;
+                                selected(value) => { root.save-appearance(root.theme-name, root.ui-font-size, root.show-room-previews, value, root.time-format); }
+                            }
+                            Text { text: "Time format"; color: Theme.muted; font-size: Theme.font-small; }
+                            ComboBox {
+                                model: ["24h", "12h"];
+                                current-value <=> root.time-format;
+                                selected(value) => { root.save-appearance(root.theme-name, root.ui-font-size, root.show-room-previews, root.message-layout, value); }
+                            }
+                            Text { text: "Your bubbles"; color: Theme.muted; font-size: Theme.font-small; }
+                            SwatchRow {
+                                selected: root.own-bubble-choice;
+                                theme-color: Theme.accent;
+                                picked(hex) => { root.own-bubble-choice = hex; root.save-bubble-colors(hex, root.other-bubble-choice); }
+                            }
+                            Text { text: "Other people's bubbles"; color: Theme.muted; font-size: Theme.font-small; }
+                            SwatchRow {
+                                selected: root.other-bubble-choice;
+                                theme-color: Theme.hover;
+                                picked(hex) => { root.other-bubble-choice = hex; root.save-bubble-colors(root.own-bubble-choice, hex); }
+                            }
+                            Text { text: "Sort rooms by"; color: Theme.muted; font-size: Theme.font-small; }
+                            ComboBox {
+                                model: ["activity", "unread", "name"];
+                                current-value <=> root.room-sort;
+                                selected(value) => { root.save-room-list(value, root.group-rooms); }
+                            }
+                            CheckBox { text: "Group rooms into Favourites, People, Rooms and Low priority"; checked <=> root.group-rooms; toggled => { root.save-room-list(root.room-sort, root.group-rooms); } }
+                            CheckBox { text: "Show newest message under rooms"; checked <=> root.show-room-previews; toggled => { root.save-appearance(root.theme-name, root.ui-font-size, root.show-room-previews, root.message-layout, root.time-format); } }
+                            Text { text: "Color emoji: Twemoji © Twitter/X, CC-BY 4.0"; color: Theme.muted; font-size: Theme.font-small; }
+                        }
+                        if root.settings-tab == "Notifications" : VerticalLayout { spacing: 8px;
+                            Text { text: "Notification defaults are inherited by new rooms."; color: Theme.muted; wrap: word-wrap; }
+                            Text { text: "Group rooms"; color: Theme.text; font-weight: 700; font-size: Theme.font-small; }
+                            HorizontalLayout { cross-axis-alignment: center; spacing: 5px;
+                                CompactButton { text: "All"; clicked => { root.set-notification-default(false, "all"); } }
+                                CompactButton { text: "Mentions"; clicked => { root.set-notification-default(false, "mentions"); } }
+                                CompactButton { text: "Mute"; clicked => { root.set-notification-default(false, "mute"); } }
+                                Rectangle { background: transparent; }
+                            }
+                            Text { text: "Direct messages"; color: Theme.text; font-weight: 700; font-size: Theme.font-small; }
+                            HorizontalLayout { cross-axis-alignment: center; spacing: 5px;
+                                CompactButton { text: "All"; clicked => { root.set-notification-default(true, "all"); } }
+                                CompactButton { text: "Mentions"; clicked => { root.set-notification-default(true, "mentions"); } }
+                                CompactButton { text: "Mute"; clicked => { root.set-notification-default(true, "mute"); } }
+                                Rectangle { background: transparent; }
+                            }
+                        }
+                        if root.settings-tab == "Sessions" : VerticalLayout { spacing: 8px;
+                            Text { text: "Verified sessions can read your encrypted history."; color: Theme.muted; wrap: word-wrap; }
+                            Text { text: "User to verify (leave blank for your own sessions)"; color: Theme.muted; font-size: Theme.font-small; }
+                            HorizontalLayout { cross-axis-alignment: center; spacing: 6px;
+                                LineEdit { text <=> root.verify-target; placeholder-text: "@user:homeserver"; }
+                                IconButton { glyph: "refresh"; clicked => { root.load-devices(root.verify-target); } }
+                            }
+                            if root.devices.length == 0 : Text { text: "No sessions loaded for this user."; color: Theme.muted; font-size: Theme.font-small; }
+                            ListView {
+                                for device in root.devices : Rectangle {
+                                    height: 48px; border-radius: 6px; background: Theme.panel;
+                                    HorizontalLayout { padding-left: 9px; padding-right: 7px; spacing: 8px; cross-axis-alignment: center;
+                                        MaterialIcon { glyph: device.verified ? "verified" : "warning"; color: device.verified ? Theme.success : Theme.danger; width: 18px; }
+                                        VerticalLayout { alignment: center; spacing: 1px;
+                                            Text { text: device.name + (device.own ? "  (this session)" : ""); color: Theme.text; font-size: Theme.font-small; overflow: elide; }
+                                            Text { text: device.device-id; color: Theme.muted; font-size: Theme.font-small; overflow: elide; }
+                                        }
+                                        Rectangle { background: transparent; }
+                                        CompactButton { visible: !device.own && !device.verified; text: "Verify"; clicked => { root.verify-device(device.user-id, device.device-id); } }
+                                    }
+                                }
+                            }
+                        }
+                        if root.settings-tab == "Security" : VerticalLayout { spacing: 8px;
+                            Text { text: "Security & Privacy"; color: Theme.text; font-weight: 700; }
+                            Text { text: "Messages in encrypted rooms are decrypted on this device. Verify your sessions so they can read history."; color: Theme.muted; wrap: word-wrap; }
+                            HorizontalLayout { cross-axis-alignment: center;
+                                CompactButton { text: "Refresh ignored users"; clicked => { root.refresh-ignored(); } }
+                                Rectangle { background: transparent; }
+                            }
+                            if root.ignored-users.length == 0 : Text { text: "Nobody is ignored."; color: Theme.muted; font-size: Theme.font-small; }
+                            ListView {
+                                for mxid in root.ignored-users : Rectangle {
+                                    height: 36px; background: Theme.panel; border-radius: 5px;
+                                    HorizontalLayout { padding-left: 8px; padding-right: 5px; spacing: 6px; cross-axis-alignment: center;
+                                        Text { text: mxid; color: Theme.text; font-size: Theme.font-small; vertical-alignment: center; overflow: elide; }
+                                        Rectangle { background: transparent; }
+                                        CompactButton { text: "Un-ignore"; clicked => { root.unignore-user(mxid); } }
+                                    }
+                                }
+                            }
+                        }
+                        if root.settings-tab == "Emoji" : VerticalLayout { spacing: 8px;
+                            Text { text: "Custom emoji and sticker packs are loaded from your account and joined rooms."; color: Theme.muted; wrap: word-wrap; }
+                            HorizontalLayout { cross-axis-alignment: center; spacing: 6px;
+                                Text { text: root.emoji-packs.length + " loaded pack" + (root.emoji-packs.length == 1 ? "" : "s"); color: Theme.text; font-size: Theme.font-small; horizontal-stretch: 1; }
+                                // Open the picker before closing this popup: closing first ends the handler.
+                                CompactButton { text: "Open picker"; clicked => {
+                                    root.picker-mode = "compose";
+                                    root.picker-tab = "custom";
+                                    root.emoji-query = "";
+                                    root.search-emoji("", "custom");
+                                    emoji-popup.show();
+                                    settings-popup.close();
+                                } }
+                            }
+                            if root.emoji-packs.length == 0 : Rectangle { height: 56px; background: Theme.panel; border-radius: Theme.radius-sm;
+                                Text { x: Theme.space-md; width: parent.width - 2 * Theme.space-md; text: "No packs were found in your account or joined rooms."; color: Theme.muted; font-size: Theme.font-small; wrap: word-wrap; }
+                            }
+                            ListView {
+                                for pack[index] in root.emoji-packs : VerticalLayout {
+                                    padding-bottom: 6px;
+                                    Rectangle {
+                                        height: pack-layout.preferred-height;
+                                        background: Theme.panel;
+                                        border-radius: Theme.radius-sm;
+                                        pack-layout := VerticalLayout {
+                                            padding: Theme.space-sm;
+                                            spacing: Theme.space-sm;
+                                            // The whole header toggles the pack, not just part of it.
+                                            Rectangle {
+                                                height: 36px;
+                                                border-radius: Theme.radius-xs;
+                                                background: pack-touch.has-hover ? Theme.hover : transparent;
+                                                HorizontalLayout {
+                                                    spacing: Theme.space-sm;
+                                                    cross-axis-alignment: center;
+                                                    MaterialIcon { glyph: root.expanded-pack == index ? "expand_less" : "expand_more"; }
+                                                    VerticalLayout {
+                                                        alignment: center;
+                                                        horizontal-stretch: 1;
+                                                        Text { text: pack.name; color: Theme.text; font-size: Theme.font-label; font-weight: 700; overflow: elide; }
+                                                        Text { text: pack.count + " images" + (pack.source == "" ? "" : " · " + pack.source); color: Theme.muted; font-size: Theme.font-small; overflow: elide; }
+                                                    }
+                                                }
+                                                pack-touch := TouchArea { mouse-cursor: pointer; clicked => { root.expanded-pack = root.expanded-pack == index ? -1 : index; } }
+                                            }
+                                            if root.expanded-pack == index : FlexboxLayout {
+                                                spacing: 2px;
+                                                for emoji in pack.images : Rectangle {
+                                                    width: 40px;
+                                                    height: 40px;
+                                                    border-radius: Theme.radius-xs;
+                                                    background: pack-emoji-touch.has-hover ? Theme.selection : transparent;
+                                                    if emoji.has-image : Image { width: 32px; height: 32px; source: emoji.image; image-fit: contain; }
+                                                    if !emoji.has-image : Text { width: parent.width; text: emoji.name; color: Theme.muted; font-size: 10px; horizontal-alignment: center; overflow: elide; }
+                                                    pack-emoji-touch := TouchArea { mouse-cursor: pointer; clicked => { root.copy-text(":" + emoji.name + ":"); } }
+                                                    Tooltip { text: @markdown(":\{emoji.name}:"); }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            Text { text: "Click an emoji to copy its shortcode."; color: Theme.muted; font-size: Theme.font-small; }
+                        }
+                        if root.settings-tab == "Links" : VerticalLayout { spacing: 8px;
+                            Text { text: "Alternative front ends and inline previews"; color: Theme.text; font-weight: 700; }
+                            Text { text: "Preview requests reveal your IP address and the link to the selected front end."; color: Theme.warning; font-size: Theme.font-small; wrap: word-wrap; }
+                            ListView {
+                                for rule[index] in root.embed-rules : Rectangle {
+                                    min-height: 132px; background: Theme.panel; border-radius: 7px;
+                                    VerticalLayout { padding: 9px; spacing: 5px;
+                                        enabled := CheckBox { text: rule.name; checked: rule.enabled; toggled => { root.save-embed-rule(index, self.checked, hosts.text, opener.text, api.text); } }
+                                        hosts := LineEdit { text: rule.hosts; placeholder-text: "Matched hostnames, comma separated"; edited => { root.save-embed-rule(index, enabled.checked, self.text, opener.text, api.text); } }
+                                        opener := LineEdit { text: rule.open-with; placeholder-text: "Open links with"; edited => { root.save-embed-rule(index, enabled.checked, hosts.text, self.text, api.text); } }
+                                        api := LineEdit { text: rule.api; placeholder-text: "Preview API (optional)"; edited => { root.save-embed-rule(index, enabled.checked, hosts.text, opener.text, self.text); } }
+                                    }
+                                }
+                            }
+                        }
+                        Rectangle { background: transparent; }
+                    }
+                }
+            }
+        }
+    }
+
+    incoming-popup := PopupWindow {
+        x: root.width / 2 - 190px; y: root.height / 2 - 90px; width: 380px; height: 180px;
+        Rectangle { background: Theme.panel; border-color: Theme.selection; border-width: 1px; border-radius: 10px;
+            VerticalLayout { padding: 16px; spacing: 9px;
+                Text { text: "Verify this session?"; color: Theme.text; font-size: 17px; font-weight: 700; }
+                Text { text: root.incoming-verification-user + " wants to verify. Compare the emoji on both devices."; color: Theme.muted; wrap: word-wrap; font-size: Theme.font-small; }
+                Rectangle { background: transparent; }
+                HorizontalLayout { cross-axis-alignment: center; spacing: 6px;
+                    CompactButton { text: "Accept"; clicked => { root.accept-verification(); } }
+                    CompactButton { text: "Decline"; clicked => { root.decline-verification(); } }
+                    Rectangle { background: transparent; }
+                }
+            }
+        }
+    }
+
+    sas-popup := PopupWindow {
+        x: root.width / 2 - 310px; y: root.height / 2 - 170px; width: 620px; height: 340px;
+        Rectangle { background: Theme.panel; border-color: Theme.selection; border-width: 1px; border-radius: 10px;
+            VerticalLayout { padding: 18px; spacing: 12px;
+                Text { text: "Compare security symbols"; color: Theme.text; font-size: 18px; font-weight: 700; horizontal-alignment: center; }
+                Text { text: "Confirm only when all seven emoji and all three numbers match on the other device."; color: Theme.muted; font-size: Theme.font-small; horizontal-alignment: center; wrap: word-wrap; }
+                HorizontalLayout { spacing: 8px;
+                    for item in root.sas-emojis : VerticalLayout {
+                        width: 74px; spacing: 4px; alignment: center; cross-axis-alignment: center;
+                        if item.has-image : Image { source: item.image; image-fit: contain; width: 44px; height: 44px; }
+                        if !item.has-image : Text { text: item.symbol; font-size: 34px; horizontal-alignment: center; }
+                        Text { text: item.description; color: Theme.text; font-size: Theme.font-small; horizontal-alignment: center; overflow: elide; }
+                    }
+                }
+                Text { text: root.sas-decimals; color: Theme.text; font-size: 22px; font-weight: 700; horizontal-alignment: center; }
+                Rectangle { background: transparent; }
+                HorizontalLayout { cross-axis-alignment: center; spacing: 8px; alignment: center;
+                    CompactButton { text: "They match"; clicked => { root.confirm-verification(true); } }
+                    CompactButton { text: "They do not match"; clicked => { root.confirm-verification(false); } }
+                }
+            }
+        }
+    }
+
+    profile-popup := PopupWindow {
+        x: max(8px, min(root.width - self.width - 8px, root.profile-x));
+        y: max(8px, min(root.height - self.height - 8px, root.profile-y));
+        width: 300px;
+        height: profile-layout.preferred-height;
+        close-policy: close-on-click-outside;
+        Rectangle {
+            background: Theme.panel;
+            border-color: Theme.border;
+            border-width: 1px;
+            border-radius: Theme.radius-md;
+            drop-shadow-blur: 16px;
+            drop-shadow-color: #00000066;
+            profile-layout := VerticalLayout {
+                padding: Theme.space-lg;
+                spacing: Theme.space-sm;
+                cross-axis-alignment: center;
+                Avatar { size: 64px; source: root.profile-avatar; has-image: root.profile-has-avatar; initial: root.profile-initial; }
+                Text { text: root.profile-name; color: Theme.text; font-size: Theme.font-heading; font-weight: 700; overflow: elide; }
+                Text { text: root.profile-id; color: Theme.muted; font-size: Theme.font-small; overflow: elide; }
+                Text {
+                    text: (root.profile-online ? "● online" : "○ offline") + "  ·  " + root.profile-shared-rooms + " shared room" + (root.profile-shared-rooms == 1 ? "" : "s");
+                    color: root.profile-online ? Theme.success : Theme.muted;
+                    font-size: Theme.font-small;
+                }
+                HorizontalLayout {
+                    padding-top: Theme.space-xs;
+                    spacing: Theme.space-sm;
+                    if !root.profile-is-self : IconButton { glyph: "chat"; tooltip: "Message"; clicked => { root.open-dm(root.profile-id, root.profile-name); profile-popup.close(); } }
+                    IconButton { glyph: "alternate_email"; tooltip: "Mention"; clicked => { root.mention-profile(root.profile-id); profile-popup.close(); } }
+                    if !root.profile-is-self : IconButton { glyph: "verified_user"; tooltip: "Verify"; clicked => { root.settings-tab = "Sessions"; root.verify-profile(root.profile-id); profile-popup.close(); settings-popup.show(); } }
+                    IconButton { glyph: "content_copy"; tooltip: "Copy ID"; clicked => { root.copy-text(root.profile-id); } }
+                }
+            }
+        }
+    }
+}

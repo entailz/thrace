@@ -1,0 +1,19 @@
+// Row models pushed from src/app/slint_bridge.rs.
+export struct RoomView { source-index: int, id: string, name: string, preview: string, unread: int, mentioned: bool, selected: bool, is-dm: bool, avatar: image, has-avatar: bool, initial: string, header: bool, collapsed: bool, typing: bool, notify: string }
+export struct ReceiptView { name: string, avatar: image, has-avatar: bool, initial: string }
+export struct ReactionView { key: string, display: string, count: int, reactors: string, reactor-users: [ReceiptView], image: image, has-image: bool, owned: bool }
+export struct EmbedView { author: string, handle: string, text: string, link: string, avatar: image, has-avatar: bool, media: image, has-media: bool }
+export struct CodeTokenView { text: string, kind: string }
+export struct CodeLineView { tokens: [CodeTokenView] }
+export struct MessageBlockView { kind: string, text: string, styled: styled-text, language: string, lines: [CodeLineView] }
+export struct MessageView { id: string, sender-id: string, sender: string, body: string, blocks: [MessageBlockView], time: string, grouped: bool, own: bool, edited: bool, sticker: bool, avatar: image, has-avatar: bool, initial: string, reply: string, reply-sender: string, reply-body: string, reply-avatar: image, reply-has-avatar: bool, reply-id: string, reactions: [ReactionView], receipts: [ReceiptView], embeds: [EmbedView], media: image, has-media: bool, media-label: string, media-kind: string, media-state: string, media-playing: bool, media-progress: float, custom-emoji: image, has-custom-emoji: bool, custom-emoji-name: string, content-width: int, sender-color: color, day-divider: string, unread-marker: bool, seen-by: string }
+export struct MemberView { name: string, id: string, presence: string, avatar: image, has-avatar: bool, initial: string, group: string, group-start: bool }
+export struct PinView { id: string, sender: string, body: string, time: string, avatar: image, has-avatar: bool, initial: string, media: image, has-media: bool, media-kind: string, media-label: string }
+export struct EmojiView { value: string, name: string, pack: string, image: image, has-image: bool, custom: bool, sticker: bool }
+export struct PackView { name: string, source: string, count: int, images: [EmojiView] }
+export struct EmbedRuleView { name: string, enabled: bool, hosts: string, open-with: string, api: string }
+export struct DeviceView { user-id: string, device-id: string, name: string, verified: bool, own: bool }
+export struct SasEmojiView { symbol: string, description: string, image: image, has-image: bool }
+export struct EmojiCategoryView { name: string, image: image, has-image: bool, symbol: string }
+export struct UploadView { name: string, mime: string, size: string }
+export struct CommandView { command: string, description: string }

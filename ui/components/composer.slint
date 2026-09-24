@@ -1,0 +1,227 @@
+import { ListView, TextEdit } from "std-widgets.slint";
+import { Theme } from "../theme.slint";
+import { UploadView, MemberView, CommandView } from "../types.slint";
+import { Avatar, IconButton, CompactButton, MaterialIcon, SectionLabel } from "primitives.slint";
+
+// Frame for a suggestion list (mentions or commands) shown above the composer box.
+component SuggestionFrame inherits Rectangle {
+    in property <string> title;
+    in property <int> count;
+    height: min(180px, 32px + root.count * 32px);
+    background: Theme.panel;
+    border-color: Theme.border;
+    border-width: 1px;
+    border-radius: Theme.radius-sm;
+    VerticalLayout {
+        padding: Theme.space-xs;
+        spacing: 2px;
+        SectionLabel { text: root.title; height: 20px; vertical-alignment: center; }
+        @children
+    }
+}
+
+// Message input: unverified banner, suggestions, reply/edit context, pending uploads and editor.
+export component Composer inherits Rectangle {
+    in property <string> room-title;
+    in property <string> context;
+    in property <bool> session-unverified: false;
+    in property <[UploadView]> uploads;
+    in property <[MemberView]> mentions;
+    in property <[CommandView]> commands;
+    in-out property <string> text;
+    callback send(string);
+    callback cancel-context;
+    callback edit-last;
+    callback accept-mention(string);
+    callback complete-command(string);
+    callback remove-upload(int);
+    callback attach;
+    callback paste;
+    callback open-emoji;
+    callback verify-session;
+
+    property <int> mention-selected: 0;
+    property <int> command-selected: 0;
+    property <bool> can-send: root.text != "" || root.uploads.length > 0;
+
+    height: outer.preferred-height;
+    background: Theme.bg;
+
+    outer := VerticalLayout {
+        padding-left: Theme.space-lg;
+        padding-right: Theme.space-lg;
+        padding-top: Theme.space-xs;
+        padding-bottom: Theme.space-md;
+        spacing: Theme.space-xs;
+
+        if root.session-unverified : Rectangle {
+            height: 32px;
+            background: Theme.danger-container;
+            border-radius: Theme.radius-sm;
+            HorizontalLayout {
+                padding-left: Theme.space-md;
+                padding-right: Theme.space-xs;
+                spacing: Theme.space-sm;
+                cross-axis-alignment: center;
+                MaterialIcon { glyph: "gpp_maybe"; color: Theme.on-danger-container; }
+                Text { text: "This session is unverified"; color: Theme.on-danger-container; font-size: Theme.font-small; horizontal-stretch: 1; }
+                CompactButton { text: "Verify"; clicked => { root.verify-session(); } }
+            }
+        }
+
+        if root.mentions.length > 0 : SuggestionFrame {
+            title: "MENTION A MEMBER";
+            count: root.mentions.length;
+            ListView { for person[index] in root.mentions : Rectangle {
+                height: 32px;
+                border-radius: Theme.radius-xs;
+                background: index == root.mention-selected || mention-touch.has-hover ? Theme.selection : transparent;
+                HorizontalLayout {
+                    padding-left: Theme.space-sm;
+                    padding-right: Theme.space-sm;
+                    spacing: Theme.space-sm;
+                    cross-axis-alignment: center;
+                    Avatar { size: 22px; source: person.avatar; has-image: person.has-avatar; initial: person.initial; }
+                    Text { text: person.name; color: Theme.text; font-size: Theme.font-label; font-weight: 600; horizontal-stretch: 0; }
+                    Text { text: person.id; color: Theme.muted; font-size: Theme.font-small; overflow: elide; horizontal-stretch: 1; }
+                }
+                mention-touch := TouchArea { mouse-cursor: pointer; clicked => { root.mention-selected = index; root.accept-mention(person.id); } }
+            } }
+        }
+        if root.mentions.length == 0 && root.commands.length > 0 : SuggestionFrame {
+            title: "COMMANDS  ·  ENTER TO COMPLETE";
+            count: root.commands.length;
+            ListView { for command[index] in root.commands : Rectangle {
+                height: 32px;
+                border-radius: Theme.radius-xs;
+                background: index == root.command-selected || command-touch.has-hover ? Theme.selection : transparent;
+                HorizontalLayout {
+                    padding-left: Theme.space-sm;
+                    padding-right: Theme.space-sm;
+                    spacing: Theme.space-sm;
+                    cross-axis-alignment: center;
+                    Text { text: command.command; color: Theme.accent; font-size: Theme.font-label; font-weight: 700; horizontal-stretch: 0; }
+                    Text { text: command.description; color: Theme.muted; font-size: Theme.font-small; overflow: elide; horizontal-stretch: 1; }
+                }
+                command-touch := TouchArea { mouse-cursor: pointer; clicked => { root.command-selected = index; root.complete-command(command.command); } }
+            } }
+        }
+
+        Rectangle {
+            background: Theme.panel;
+            border-color: Theme.border;
+            border-width: 1px;
+            border-radius: Theme.radius-sm;
+            VerticalLayout {
+                padding: Theme.space-xs;
+                spacing: Theme.space-xs;
+
+                // Reply/edit preview sits inside the box, like Cinny.
+                if root.context != "" : HorizontalLayout {
+                    padding-left: Theme.space-sm;
+                    spacing: Theme.space-sm;
+                    cross-axis-alignment: center;
+                    MaterialIcon { glyph: "reply"; color: Theme.accent; font-size: 16px; }
+                    Text { text: root.context; color: Theme.text; font-size: Theme.font-small; overflow: elide; horizontal-stretch: 1; }
+                    IconButton { width: 26px; height: 26px; icon-size: 16px; glyph: "close"; tooltip: "Cancel"; clicked => { root.cancel-context(); } }
+                }
+
+                if root.uploads.length > 0 : HorizontalLayout {
+                    padding-left: Theme.space-xs;
+                    spacing: Theme.space-xs;
+                    alignment: start;
+                    for upload[index] in root.uploads : Rectangle {
+                        height: 30px;
+                        width: min(200px, upload-row.preferred-width);
+                        border-radius: Theme.radius-xs;
+                        background: Theme.selection;
+                        upload-row := HorizontalLayout {
+                            padding-left: Theme.space-sm;
+                            padding-right: 2px;
+                            spacing: Theme.space-xs;
+                            cross-axis-alignment: center;
+                            MaterialIcon { glyph: upload.mime.starts-with("image/") ? "image" : "draft"; color: Theme.accent; }
+                            Text { text: upload.name; color: Theme.text; font-size: Theme.font-small; overflow: elide; }
+                            Text { text: upload.size; color: Theme.muted; font-size: Theme.font-small; }
+                            IconButton { width: 24px; height: 24px; icon-size: 16px; glyph: "close"; clicked => { root.remove-upload(index); } }
+                        }
+                    }
+                }
+
+                HorizontalLayout {
+                    spacing: Theme.space-xs;
+                    cross-axis-alignment: center;
+                    IconButton { glyph: "attach_file"; tooltip: "Attach a file"; clicked => { root.attach(); } }
+                    IconButton { glyph: "content_paste"; tooltip: "Paste an image"; clicked => { root.paste(); } }
+                    editor := TextEdit {
+                        property <length> editor-height: 40px;
+                        height: self.editor-height;
+                        horizontal-stretch: 1;
+                        text <=> root.text;
+                        placeholder-text: "Message " + root.room-title;
+                        font-size: Theme.chat-body;
+                        wrap: word-wrap;
+                        changed content-height => {
+                            self.editor-height = min(160px, max(40px, self.content-height + 8px));
+                        }
+                        key-pressed(event) => {
+                            if (root.mentions.length > 0) {
+                                if (event.text == Key.DownArrow) {
+                                    root.mention-selected = Math.mod(root.mention-selected + 1, root.mentions.length);
+                                    return accept;
+                                }
+                                if (event.text == Key.UpArrow) {
+                                    root.mention-selected = Math.mod(root.mention-selected + root.mentions.length - 1, root.mentions.length);
+                                    return accept;
+                                }
+                                if ((event.text == Key.Return && !event.modifiers.shift) || event.text == Key.Tab) {
+                                    root.accept-mention(root.mentions[root.mention-selected].id);
+                                    root.mention-selected = 0;
+                                    return accept;
+                                }
+                            }
+                            if (root.commands.length > 0) {
+                                if (event.text == Key.DownArrow) {
+                                    root.command-selected = Math.mod(root.command-selected + 1, root.commands.length);
+                                    return accept;
+                                }
+                                if (event.text == Key.UpArrow) {
+                                    root.command-selected = Math.mod(root.command-selected + root.commands.length - 1, root.commands.length);
+                                    return accept;
+                                }
+                                if ((event.text == Key.Return && !event.modifiers.shift) || event.text == Key.Tab) {
+                                    root.complete-command(root.commands[root.command-selected].command);
+                                    root.command-selected = 0;
+                                    return accept;
+                                }
+                            }
+                            if (event.text == Key.UpArrow && root.text == "" && root.context == "") {
+                                root.edit-last();
+                                return accept;
+                            }
+                            if (event.text == Key.Escape && root.context != "") {
+                                root.cancel-context();
+                                root.text = "";
+                                return accept;
+                            }
+                            if (event.text == Key.Return && !event.modifiers.shift && root.can-send) {
+                                root.send(root.text);
+                                root.text = "";
+                                return accept;
+                            }
+                            return reject;
+                        }
+                    }
+                    IconButton { glyph: "emoji_emotions"; tooltip: "Emoji and stickers"; clicked => { root.open-emoji(); } }
+                    IconButton {
+                        glyph: "send";
+                        tooltip: "Send message";
+                        enabled: root.can-send;
+                        foreground: root.can-send ? Theme.accent : Theme.muted;
+                        clicked => { root.send(root.text); root.text = ""; }
+                    }
+                }
+            }
+        }
+    }
+}

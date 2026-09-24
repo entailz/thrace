@@ -422,8 +422,8 @@ impl ThraceApp {
         for (room_id, react) in batch.reactions {
             self.apply_sync_reaction(&room_id, react);
         }
-        for (room_id, event_id, user_id) in batch.receipts {
-            self.apply_sync_receipt(&room_id, &event_id, &user_id);
+        for (room_id, event_id, user_id, ts) in batch.receipts {
+            self.apply_sync_receipt(&room_id, &event_id, &user_id, ts);
         }
         for (room_id, target, body, formatted) in batch.edits {
             self.apply_edit(&room_id, &target, body, formatted);
@@ -431,6 +431,25 @@ impl ThraceApp {
         for (room_id, redacted) in batch.redactions {
             self.apply_redaction(&room_id, &redacted);
         }
+        for (room_id, meta) in batch.room_meta {
+            if let Some(room) = self.rooms.iter_mut().find(|r| r.room_id == room_id) {
+                room.meta = meta;
+            }
+        }
+        for (room_id, users) in batch.typing {
+            let users: Vec<String> = users.into_iter().filter(|u| *u != own).collect();
+            if users.is_empty() {
+                self.typing.remove(&room_id);
+            } else {
+                self.typing.insert(room_id, users);
+            }
+        }
+        for (room_id, event_id) in batch.fully_read {
+            if let Some(room) = self.rooms.iter_mut().find(|r| r.room_id == room_id) {
+                room.fully_read = Some(event_id);
+            }
+        }
+        self.presence.extend(batch.presence);
         for flow in batch.verify_flows {
             if self.seen_incoming.insert(flow.flow_id.clone()) {
                 self.incoming = Some(flow);
@@ -491,6 +510,7 @@ impl ThraceApp {
         let text = format!("{}: {}", row.display_name, snippet(&row.body, 48));
         if let Some(room) = self.rooms.iter_mut().find(|r| r.room_id == room_id) {
             room.preview = Some(text);
+            room.last_activity = room.last_activity.max(row.origin_server_ts);
         }
     }
 
@@ -507,9 +527,10 @@ impl ThraceApp {
         room_id: &str,
         event_id: &str,
         user_id: &str,
+        ts: u64,
     ) {
         if let Some(rows) = self.timeline_for_mut(room_id) {
-            seen_in(rows.as_mut_slice(), event_id, user_id);
+            seen_in(rows.as_mut_slice(), event_id, user_id, ts);
         }
     }
 
@@ -546,12 +567,12 @@ impl ThraceApp {
             let Some(room) = client.get_room(&room_id) else {
                 return SendResult::Failed("room not found".into());
             };
-            use matrix_sdk::ruma::api::client::receipt::create_receipt::v3::ReceiptType;
-            use matrix_sdk::ruma::events::receipt::ReceiptThread;
-            match room
-                .send_single_receipt(ReceiptType::Read, ReceiptThread::Unthreaded, event_id)
-                .await
-            {
+            // Move the fully-read marker with the receipt so the "New messages" line
+            // is gone the next time the room is opened.
+            let receipts = matrix_sdk::room::Receipts::new()
+                .fully_read_marker(event_id.clone())
+                .public_read_receipt(event_id);
+            match room.send_multiple_receipts(receipts).await {
                 // Silent: receipts are background traffic.
                 Ok(()) => SendResult::Done(String::new()),
                 Err(error) => SendResult::Failed(format!("receipt: {error}")),
@@ -598,6 +619,13 @@ impl ThraceApp {
         self.members = self.members_by_room.remove(&id).unwrap_or_default();
         self.replying_to = None;
         self.react_target = None;
+        // Only mark a room that had unread messages. Many clients send read receipts without
+        // moving `m.fully_read`, so the marker alone can point far back in history.
+        self.unread_marker = if self.rooms[idx].unread > 0 {
+            self.rooms[idx].fully_read.clone()
+        } else {
+            None
+        };
         self.rooms[idx].unread = 0;
         self.rooms[idx].mentioned = false;
         // The wire receipt follows from the timeline once it renders at the

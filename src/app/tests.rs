@@ -15,8 +15,9 @@ use crate::app::rows::{
 use crate::app::session::extract_login_token;
 use crate::app::sync::{sync_filter, SYNC_TIMELINE_LIMIT};
 use crate::app::text::{
-    format_ts, localpart, mention_mxid, mention_prefix, mentioned_ids_in, now_millis,
-    rich_bodies_in, sanitise, short_room, shortcode_end, truncate_name,
+    continues_group, format_ts, format_ts_clock, local_day, localpart, mention_mxid,
+    mention_prefix, mentioned_ids_in, now_millis, rich_bodies_in, sanitise, short_room,
+    shortcode_end, truncate_name,
 };
 
 fn row(id: &str, sender: &str, body: &str, txn: Option<&str>) -> TimelineRow {
@@ -201,7 +202,8 @@ fn shared_rooms_counts_the_current_room_once() {
     let member = |mxid: &str| Member {
         display: mxid.trim_start_matches('@').into(),
         mxid: mxid.into(),
-        online: false,
+        power: 0,
+        presence: None,
         avatar_mxc: None,
     };
     let mut by_room = std::collections::HashMap::new();
@@ -346,7 +348,8 @@ fn mention_member(mxid: &str, display: &str) -> Member {
     Member {
         display: display.into(),
         mxid: mxid.into(),
-        online: true,
+        power: 0,
+        presence: None,
         avatar_mxc: None,
     }
 }
@@ -359,6 +362,7 @@ fn emoji_packs() -> PackStore {
         images: vec![crate::matrix::PackImage {
             shortcode: "dance".into(),
             mxc_url: "mxc://hs/aaa".into(),
+            is_emoji: true,
             is_sticker: false,
         }],
     });
@@ -597,7 +601,7 @@ fn receipt_for_an_unloaded_event_leaves_the_old_one_alone() {
     let mut rows = [row("$a", "@b:hs", "hi", None)];
     rows[0].seen_by = vec!["@reader:hs".into()];
 
-    assert!(!seen_in(&mut rows, "$not-loaded", "@reader:hs"));
+    assert!(!seen_in(&mut rows, "$not-loaded", "@reader:hs", 0));
     assert_eq!(
         rows[0].seen_by,
         vec!["@reader:hs".to_owned()],
@@ -611,10 +615,10 @@ fn a_receipt_moves_forward_to_the_newer_message() {
         row("$a", "@b:hs", "first", None),
         row("$b", "@b:hs", "second", None),
     ];
-    assert!(seen_in(&mut rows, "$a", "@reader:hs"));
+    assert!(seen_in(&mut rows, "$a", "@reader:hs", 0));
     assert_eq!(rows[0].seen_by.len(), 1);
 
-    assert!(seen_in(&mut rows, "$b", "@reader:hs"));
+    assert!(seen_in(&mut rows, "$b", "@reader:hs", 0));
     assert!(rows[0].seen_by.is_empty(), "must leave the older message");
     assert_eq!(rows[1].seen_by, vec!["@reader:hs".to_owned()]);
 }
@@ -736,7 +740,7 @@ fn sync_batch_is_empty_only_when_nothing_landed() {
     );
     batch
         .receipts
-        .push(("!r:hs".into(), "$e".into(), "@u:hs".into()));
+        .push(("!r:hs".into(), "$e".into(), "@u:hs".into(), 0));
     assert!(!batch.is_empty(), "receipts still need applying");
 }
 
@@ -1044,4 +1048,133 @@ fn upload_sniffs_mime_and_caps_size() {
         vec![0u8; PendingUpload::MAX_BYTES + 1]
     )
     .is_err());
+}
+
+fn stamped(id: &str, sender: &str, origin_server_ts: u64) -> TimelineRow {
+    TimelineRow {
+        origin_server_ts,
+        ..row(id, sender, "hi", None)
+    }
+}
+
+#[test]
+fn grouping_needs_same_sender_within_two_minutes() {
+    // Midday, so the local day cannot change within the offsets used here.
+    let noon = chrono::Local::now()
+        .date_naive()
+        .and_hms_opt(12, 0, 0)
+        .unwrap()
+        .and_local_timezone(chrono::Local)
+        .unwrap()
+        .timestamp_millis() as u64;
+    let first = stamped("$1", "@a:x", noon);
+    assert!(continues_group(
+        &first,
+        &stamped("$2", "@a:x", noon + 119_000)
+    ));
+    assert!(!continues_group(
+        &first,
+        &stamped("$2", "@a:x", noon + 120_000)
+    ));
+    assert!(!continues_group(
+        &first,
+        &stamped("$2", "@b:x", noon + 1_000)
+    ));
+    assert!(!continues_group(
+        &stamped("$0", "system", noon),
+        &stamped("$1", "system", noon)
+    ));
+    // Local echoes have no server stamp yet and stay with their sender.
+    assert!(continues_group(&first, &stamped("$2", "@a:x", 0)));
+}
+
+#[test]
+fn grouping_breaks_across_local_days() {
+    let midnight = chrono::Local::now()
+        .date_naive()
+        .and_hms_opt(0, 0, 0)
+        .unwrap()
+        .and_local_timezone(chrono::Local)
+        .unwrap()
+        .timestamp_millis() as u64;
+    let late = stamped("$1", "@a:x", midnight - 30_000);
+    let early = stamped("$2", "@a:x", midnight + 30_000);
+    assert_ne!(
+        local_day(late.origin_server_ts),
+        local_day(early.origin_server_ts)
+    );
+    assert!(!continues_group(&late, &early));
+    assert_eq!(local_day(0), None);
+}
+
+#[cfg(feature = "slint-ui")]
+#[test]
+fn day_labels_name_recent_days() {
+    use crate::app::text::day_label;
+    let today = chrono::NaiveDate::from_ymd_opt(2026, 9, 23).unwrap();
+    assert_eq!(day_label(today, today), "Today");
+    assert_eq!(day_label(today.pred_opt().unwrap(), today), "Yesterday");
+    assert_eq!(
+        day_label(chrono::NaiveDate::from_ymd_opt(2026, 3, 2).unwrap(), today),
+        "Monday, 02 March"
+    );
+    assert_eq!(
+        day_label(
+            chrono::NaiveDate::from_ymd_opt(2025, 12, 31).unwrap(),
+            today
+        ),
+        "31 December 2025"
+    );
+}
+
+#[test]
+fn clock_setting_picks_24_or_12_hour_times() {
+    let afternoon = chrono::Local::now()
+        .date_naive()
+        .and_hms_opt(13, 5, 0)
+        .unwrap()
+        .and_local_timezone(chrono::Local)
+        .unwrap()
+        .timestamp_millis() as u64;
+    assert_eq!(format_ts_clock(Some(afternoon), false), "13:05");
+    assert_eq!(format_ts_clock(Some(afternoon), true), "1:05 PM");
+    assert_eq!(format_ts(Some(afternoon)), "13:05");
+}
+
+#[test]
+fn presence_events_map_to_a_state() {
+    use crate::app::decode::presence_update;
+    let event = |content: serde_json::Value| serde_json::json!({ "type": "m.presence", "sender": "@a:hs", "content": content });
+    assert_eq!(
+        presence_update(&event(serde_json::json!({ "presence": "offline" }))),
+        Some(("@a:hs".into(), "offline".into()))
+    );
+    assert_eq!(
+        presence_update(&event(
+            serde_json::json!({ "presence": "unavailable", "currently_active": true })
+        )),
+        Some(("@a:hs".into(), "online".into()))
+    );
+    assert_eq!(presence_update(&event(serde_json::json!({}))), None);
+}
+
+#[test]
+fn a_receipt_on_a_hidden_event_lands_on_the_message_before_it() {
+    let stamped = |id: &str, ts: u64| TimelineRow {
+        origin_server_ts: ts,
+        ..row(id, "@b:hs", "hi", None)
+    };
+    let mut rows = [
+        stamped("$a", 1_000),
+        stamped("$b", 2_000),
+        stamped("$c", 3_000),
+    ];
+    // The reader's receipt points at a reaction sent after "$b".
+    assert!(seen_in(&mut rows, "$reaction", "@reader:hs", 2_500));
+    assert_eq!(rows[1].seen_by, vec!["@reader:hs".to_owned()]);
+    // An older stamp can't pull the receipt back.
+    assert!(!seen_in(&mut rows, "$older", "@reader:hs", 1_500));
+    assert_eq!(rows[1].seen_by, vec!["@reader:hs".to_owned()]);
+    assert!(seen_in(&mut rows, "$c", "@reader:hs", 0));
+    assert!(rows[1].seen_by.is_empty());
 }

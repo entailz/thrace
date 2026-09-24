@@ -6,7 +6,7 @@ Please see LICENSE in the repository root for full details.
 //! Wire format to `TimelineRow`: history pages, sync batches and attachments.
 
 use crate::app::rows::{
-    bundled_annotations, edit_in, edit_replacement, merge_reactions, split_reply_fallback,
+    bundled_annotations, edit_in, edit_replacement, merge_reactions, seen_in, split_reply_fallback,
 };
 use crate::app::text::{format_ts, localpart, now_millis};
 use crate::app::{AudioAttachment, ImageAttachment, Member, SyncBatch, SyncReaction, TimelineRow};
@@ -69,17 +69,38 @@ pub(in crate::app) async fn load_initial_history(
 ) -> Result<(Vec<TimelineRow>, Option<String>, Vec<Member>), String> {
     let id = matrix_sdk::ruma::OwnedRoomId::try_from(room_id).map_err(|e| e.to_string())?;
     let room = client.get_room(&id).ok_or("room not found")?;
-    let members: Vec<Member> = room
+    let room_members: Vec<_> = room
         .members_no_sync(matrix_sdk::RoomMemberships::ACTIVE)
         .await
         .map_err(|e| format!("members: {e}"))?
         .into_iter()
         .take(50)
+        .collect();
+    let ids: Vec<_> = room_members
+        .iter()
+        .map(|m| m.user_id().to_owned())
+        .collect();
+    let mut presence: std::collections::HashMap<String, String> = client
+        .state_store()
+        .get_presence_events(&ids)
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|raw| presence_update(&serde_json::to_value(raw).ok()?))
+        .collect();
+    let members: Vec<Member> = room_members
+        .into_iter()
         .map(|m| Member {
+            presence: presence.remove(m.user_id().as_str()),
             display: m.display_name().unwrap_or_else(|| m.name()).to_owned(),
             mxid: m.user_id().to_string(),
-            online: true,
             avatar_mxc: m.avatar_url().map(|u| u.to_string()),
+            power: match m.power_level() {
+                matrix_sdk::ruma::events::room::power_levels::UserPowerLevel::Int(level) => {
+                    level.into()
+                }
+                _ => i64::MAX,
+            },
         })
         .collect();
     let avatars = members
@@ -90,8 +111,51 @@ pub(in crate::app) async fn load_initial_history(
         .iter()
         .map(|m| (m.mxid.clone(), m.display.clone()))
         .collect();
-    let (rows, token) = load_room_history(&room, &avatars, &names, None, INITIAL_HISTORY).await?;
+    let (mut rows, token) =
+        load_room_history(&room, &avatars, &names, None, INITIAL_HISTORY).await?;
+    place_stored_receipts(&room, &members, &mut rows).await;
     Ok((rows, token, members))
+}
+
+/// Put each member's stored read receipt on the rows, so seen-by avatars show right after a
+/// room loads instead of only once someone reads something new.
+async fn place_stored_receipts(
+    room: &matrix_sdk::Room,
+    members: &[Member],
+    rows: &mut [TimelineRow],
+) {
+    use matrix_sdk::ruma::events::receipt::{ReceiptThread, ReceiptType};
+    for member in members {
+        let Ok(user_id) = matrix_sdk::ruma::OwnedUserId::try_from(member.mxid.as_str()) else {
+            continue;
+        };
+        // Clients send either unthreaded or main-thread receipts; the newer one counts.
+        let mut newest: Option<(String, u64)> = None;
+        for thread in [ReceiptThread::Unthreaded, ReceiptThread::Main] {
+            if let Ok(Some((event_id, receipt))) = room
+                .load_user_receipt(ReceiptType::Read, thread, &user_id)
+                .await
+            {
+                let ts = receipt.ts.map(|ts| u64::from(ts.get())).unwrap_or_default();
+                if newest.as_ref().is_none_or(|(_, seen)| ts >= *seen) {
+                    newest = Some((event_id.to_string(), ts));
+                }
+            }
+        }
+        if let Some((event_id, ts)) = newest {
+            seen_in(rows, &event_id, &member.mxid, ts);
+        }
+    }
+}
+
+/// (user, state) from a raw `m.presence` event; `currently_active` counts as online.
+pub(in crate::app) fn presence_update(json: &serde_json::Value) -> Option<(String, String)> {
+    let sender = json.get("sender")?.as_str()?.to_owned();
+    let content = json.get("content")?;
+    let active = content.get("currently_active").and_then(|v| v.as_bool()) == Some(true);
+    let state = content.get("presence")?.as_str()?;
+    let state = if active { "online" } else { state };
+    Some((sender, state.to_owned()))
 }
 
 /// One screenful per history request. Older messages load on scroll.
@@ -417,6 +481,23 @@ pub(in crate::app) async fn decode_sync_batch(
         let Some(room) = client.get_room(room_id) else {
             continue;
         };
+        // The SDK has already applied this update's state and tags.
+        batch
+            .room_meta
+            .push((room_id_s.clone(), crate::app::session::room_meta(&room)));
+        for raw in &update.account_data {
+            let Ok(json) = serde_json::to_value(raw) else {
+                continue;
+            };
+            if json.get("type").and_then(|v| v.as_str()) != Some("m.fully_read") {
+                continue;
+            }
+            if let Some(event_id) = json.pointer("/content/event_id").and_then(|v| v.as_str()) {
+                batch
+                    .fully_read
+                    .push((room_id_s.clone(), event_id.to_owned()));
+            }
+        }
         for ev in &update.timeline.events {
             let raw = ev.kind.raw();
             let Ok(json) = serde_json::to_value(raw) else {
@@ -540,6 +621,19 @@ pub(in crate::app) async fn decode_sync_batch(
             let Ok(json) = serde_json::to_value(raw) else {
                 continue;
             };
+            if json.get("type").and_then(|v| v.as_str()) == Some("m.typing") {
+                let users = json
+                    .pointer("/content/user_ids")
+                    .and_then(|v| v.as_array())
+                    .map(|ids| {
+                        ids.iter()
+                            .filter_map(|id| id.as_str().map(str::to_owned))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                batch.typing.push((room_id_s.clone(), users));
+                continue;
+            }
             if json.get("type").and_then(|v| v.as_str()) != Some("m.receipt") {
                 continue;
             }
@@ -555,10 +649,17 @@ pub(in crate::app) async fn decode_sync_batch(
                     let Some(users) = users.as_object() else {
                         continue;
                     };
-                    for (user_id, _) in users {
-                        batch
-                            .receipts
-                            .push((room_id_s.clone(), event_id.clone(), user_id.clone()));
+                    for (user_id, receipt) in users {
+                        let ts = receipt
+                            .get("ts")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or_default();
+                        batch.receipts.push((
+                            room_id_s.clone(),
+                            event_id.clone(),
+                            user_id.clone(),
+                            ts,
+                        ));
                     }
                 }
             }
@@ -598,6 +699,14 @@ pub(in crate::app) async fn decode_sync_batch(
             user_id: sender,
             device_id: String::new(),
         });
+    }
+    for raw in &resp.presence {
+        if let Some(update) = serde_json::to_value(raw)
+            .ok()
+            .and_then(|json| presence_update(&json))
+        {
+            batch.presence.push(update);
+        }
     }
     batch
 }

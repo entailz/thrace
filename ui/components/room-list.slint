@@ -1,0 +1,218 @@
+import { ListView } from "std-widgets.slint";
+import { Theme } from "../theme.slint";
+import { RoomView } from "../types.slint";
+import { Avatar, Badge, IconButton, CompactButton, MaterialIcon, SectionLabel } from "primitives.slint";
+
+// One room in the sidebar. Collapsed, it is a centred avatar in the rail (Cinny's SidebarItem);
+// expanded, it is avatar + name/preview + unread badge.
+export component RoomRow inherits Rectangle {
+    in property <RoomView> room;
+    in property <bool> collapsed: false;
+    in property <bool> show-preview: true;
+    callback clicked;
+    // Absolute window position of a right click, for the room menu.
+    callback context-requested(length, length);
+
+    height: root.room.header ? (root.collapsed ? 13px : 32px) : root.collapsed ? 50px : (root.show-preview ? 48px : 40px);
+    border-radius: Theme.radius-sm;
+    background: root.collapsed || root.room.header ? transparent : root.room.selected ? Theme.selection : touch.has-hover ? Theme.hover : transparent;
+    animate background { duration: 150ms; easing: ease-out; }
+
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+        pointer-event(event) => {
+            if (event.button == PointerEventButton.right && event.kind == PointerEventKind.down) {
+                root.context-requested(self.absolute-position.x + self.mouse-x, self.absolute-position.y + self.mouse-y);
+            }
+        }
+    }
+
+    // Section header: a foldable label, or a short rule in the rail.
+    if root.room.header && root.collapsed : Rectangle { width: 24px; height: 1px; background: Theme.border; }
+    if root.room.header && !root.collapsed : HorizontalLayout {
+        padding-left: Theme.space-xs;
+        padding-right: Theme.space-md;
+        spacing: Theme.space-xs;
+        cross-axis-alignment: center;
+        MaterialIcon { glyph: root.room.collapsed ? "chevron_right" : "expand_more"; font-size: 16px; }
+        SectionLabel { text: root.room.name.to-uppercase(); horizontal-stretch: 1; }
+        if root.room.collapsed && root.room.unread > 0 : Badge { count: root.room.unread; }
+    }
+
+    if root.collapsed && !root.room.header : Rectangle {
+        // Selection pill hugging the rail's left edge; a shorter one previews it on hover.
+        Rectangle {
+            x: 0;
+            width: root.room.selected ? 5px : 3px;
+            height: root.room.selected ? 24px : touch.has-hover ? 16px : 0px;
+            border-top-right-radius: 4px;
+            border-bottom-right-radius: 4px;
+            background: Theme.text;
+            animate width, height { duration: 200ms; }
+        }
+        rail-avatar := Avatar {
+            size: 42px;
+            source: root.room.avatar;
+            has-image: root.room.has-avatar;
+            initial: root.room.initial;
+            border-width: root.room.selected ? 2px : 0px;
+            border-color: Theme.accent;
+        }
+        if root.room.unread > 0 : Badge {
+            x: rail-avatar.x + rail-avatar.width - self.width + 4px;
+            y: rail-avatar.y - 4px;
+            count: root.room.unread;
+            highlight: root.room.mentioned;
+        }
+        Tooltip { text: @markdown("\{root.room.name}"); }
+    }
+
+    if !root.collapsed && !root.room.header : HorizontalLayout {
+        padding-left: Theme.space-sm;
+        padding-right: Theme.space-md;
+        spacing: Theme.space-sm;
+        cross-axis-alignment: center;
+        Avatar {
+            size: root.show-preview ? 32px : 26px;
+            source: root.room.avatar;
+            has-image: root.room.has-avatar;
+            initial: root.room.initial;
+        }
+        VerticalLayout {
+            alignment: center;
+            Text {
+                text: root.room.name;
+                color: root.room.mentioned ? Theme.accent : Theme.text;
+                opacity: root.room.unread > 0 || root.room.selected ? 1 : 0.8;
+                font-size: Theme.font-label + 1px;
+                font-weight: root.room.unread > 0 ? 700 : 500;
+                overflow: elide;
+                wrap: no-wrap;
+            }
+            if root.show-preview && (root.room.preview != "" || root.room.typing) : Text {
+                text: root.room.typing ? "typing…" : root.room.preview;
+                color: root.room.typing ? Theme.accent : Theme.muted;
+                font-size: Theme.font-small;
+                overflow: elide;
+                wrap: no-wrap;
+            }
+        }
+        if root.room.notify == "mute" : MaterialIcon { glyph: "notifications_off"; font-size: 16px; }
+        if root.room.unread > 0 : Badge { count: root.room.unread; highlight: root.room.mentioned; }
+    }
+}
+
+// The conversation sidebar: header, filter chips, room list and account bar.
+export component RoomSidebar inherits Rectangle {
+    in property <[RoomView]> rooms;
+    in-out property <bool> collapsed: false;
+    in-out property <string> room-filter: "all";
+    in property <bool> show-previews: true;
+    in property <string> account-name;
+    in property <string> account-id;
+    in property <string> account-server;
+    in property <image> account-avatar;
+    in property <bool> account-has-avatar: false;
+    in property <string> account-initial;
+    callback select-room(int);
+    callback toggle-section(string);
+    callback room-context(RoomView, length, length);
+    callback open-account;
+    callback open-settings;
+    callback logout;
+
+    width: root.collapsed ? Theme.rail-width : 240px;
+    background: Theme.panel;
+    animate width { duration: 160ms; easing: ease-out; }
+
+    VerticalLayout {
+        // Rail mode has no side padding so every avatar centres in the full 66px column.
+        padding-left: root.collapsed ? 0px : Theme.space-sm;
+        padding-right: root.collapsed ? 0px : Theme.space-sm;
+        padding-bottom: Theme.space-sm;
+        spacing: Theme.space-xs;
+
+        HorizontalLayout {
+            height: Theme.header-height;
+            padding-left: root.collapsed ? 0px : Theme.space-xs;
+            alignment: root.collapsed ? center : stretch;
+            cross-axis-alignment: center;
+            if !root.collapsed : Text {
+                text: "THRACE";
+                color: Theme.text;
+                font-size: Theme.font-heading;
+                font-weight: 700;
+                horizontal-stretch: 1;
+            }
+            IconButton {
+                glyph: root.collapsed ? "chevron_right" : "chevron_left";
+                tooltip: root.collapsed ? "Expand conversations" : "Collapse conversations";
+                clicked => { root.collapsed = !root.collapsed; }
+            }
+        }
+        if !root.collapsed : HorizontalLayout {
+            padding-left: Theme.space-xs;
+            padding-bottom: Theme.space-xs;
+            spacing: Theme.space-xs;
+            alignment: start;
+            CompactButton { text: "All"; checked: root.room-filter == "all"; clicked => { root.room-filter = "all"; } }
+            CompactButton { text: "Rooms"; checked: root.room-filter == "rooms"; clicked => { root.room-filter = "rooms"; } }
+            CompactButton { text: "DMs"; checked: root.room-filter == "dms"; clicked => { root.room-filter = "dms"; } }
+        }
+        ListView {
+            vertical-scrollbar-policy: root.collapsed ? ScrollBarPolicy.always-off : ScrollBarPolicy.as-needed;
+            for room in root.rooms : RoomRow {
+                room: room;
+                collapsed: root.collapsed;
+                show-preview: root.show-previews;
+                clicked => {
+                    // Headers are plain rules in the rail, so only fold them when expanded.
+                    if (!room.header) { root.select-room(room.source-index); }
+                    else if (!root.collapsed) { root.toggle-section(room.name); }
+                }
+                context-requested(x, y) => { if (!room.header) { root.room-context(room, x, y); } }
+            }
+        }
+
+        if !root.collapsed : Rectangle {
+            height: 48px;
+            background: Theme.bg;
+            border-radius: Theme.radius-sm;
+            HorizontalLayout {
+                padding-left: Theme.space-sm;
+                padding-right: Theme.space-xs;
+                spacing: Theme.space-sm;
+                cross-axis-alignment: center;
+                Avatar {
+                    size: 32px;
+                    source: root.account-avatar;
+                    has-image: root.account-has-avatar;
+                    initial: root.account-initial;
+                    TouchArea { mouse-cursor: pointer; clicked => { root.open-account(); } }
+                }
+                VerticalLayout {
+                    alignment: center;
+                    Text { text: root.account-name == "" ? root.account-id : root.account-name; color: Theme.text; font-size: Theme.font-label; font-weight: 600; overflow: elide; wrap: no-wrap; }
+                    Text { text: root.account-server; color: Theme.muted; font-size: Theme.font-small; overflow: elide; wrap: no-wrap; }
+                }
+                IconButton { glyph: "settings"; tooltip: "Settings"; clicked => { root.open-settings(); } }
+                IconButton { glyph: "logout"; tooltip: "Sign out"; clicked => { root.logout(); } }
+            }
+        }
+        if root.collapsed : VerticalLayout {
+            spacing: Theme.space-xs;
+            cross-axis-alignment: center;
+            Avatar {
+                size: 42px;
+                source: root.account-avatar;
+                has-image: root.account-has-avatar;
+                initial: root.account-initial;
+                TouchArea { mouse-cursor: pointer; clicked => { root.open-account(); } }
+                Tooltip { text: @markdown("**\{root.account-name}**\n\{root.account-id}"); }
+            }
+            IconButton { glyph: "settings"; tooltip: "Settings"; clicked => { root.open-settings(); } }
+            IconButton { glyph: "logout"; tooltip: "Sign out"; clicked => { root.logout(); } }
+        }
+    }
+}

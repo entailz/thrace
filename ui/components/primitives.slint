@@ -1,0 +1,193 @@
+import { Theme } from "../theme.slint";
+
+// A Material Symbols glyph, centred in its box.
+export component MaterialIcon inherits Text {
+    in property <string> glyph;
+    text: root.glyph;
+    font-family: "Material Symbols Rounded";
+    font-size: 18px;
+    color: Theme.muted;
+    horizontal-alignment: center;
+    vertical-alignment: center;
+    width: 20px;
+    height: 20px;
+}
+
+// Round avatar with an initial fallback. Children with an explicit size are centred by Slint,
+// so no manual offsets are needed.
+export component Avatar inherits Rectangle {
+    in property <image> source;
+    in property <bool> has-image: false;
+    in property <string> initial;
+    in property <length> size: 32px;
+    width: root.size;
+    height: root.size;
+    border-radius: root.size / 2;
+    background: Theme.selection;
+    clip: true;
+    if root.has-image : Image {
+        width: parent.width;
+        height: parent.height;
+        source: root.source;
+        image-fit: cover;
+        image-rendering: smooth;
+    }
+    if !root.has-image : Text {
+        text: root.initial;
+        color: Theme.accent;
+        font-size: max(9px, root.size * 0.42);
+        font-weight: 700;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+}
+
+// Unread counter pill; `highlight` marks mentions.
+export component Badge inherits Rectangle {
+    in property <int> count;
+    in property <bool> highlight: false;
+    height: 16px;
+    width: max(16px, badge-label.preferred-width + 8px);
+    border-radius: self.height / 2;
+    background: root.highlight ? Theme.accent : Theme.text;
+    badge-label := Text {
+        text: root.count > 99 ? "99+" : root.count;
+        color: Theme.on-accent;
+        font-size: 10px;
+        font-weight: 700;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+}
+
+export component IconButton inherits Rectangle {
+    in property <string> glyph;
+    in property <string> tooltip;
+    in property <bool> enabled: true;
+    in property <color> foreground: Theme.text.transparentize(15%);
+    in property <length> icon-size: 18px;
+    out property <bool> hovering: icon-touch.has-hover;
+    callback clicked;
+    width: 32px;
+    height: 32px;
+    border-radius: Theme.radius-sm;
+    background: icon-touch.pressed && root.enabled ? Theme.selection : icon-touch.has-hover && root.enabled ? Theme.hover : transparent;
+    opacity: root.enabled ? 1 : 0.4;
+    animate background, opacity { duration: 150ms; easing: ease-out; }
+    MaterialIcon {
+        width: parent.width;
+        height: parent.height;
+        glyph: root.glyph;
+        font-size: root.icon-size;
+        color: root.foreground;
+    }
+    icon-touch := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+    if root.tooltip != "" : Tooltip { text: @markdown("\{root.tooltip}"); }
+}
+
+// Small text button; `checked` renders it as a selected chip.
+export component CompactButton inherits Rectangle {
+    in property <string> text;
+    in property <bool> checked: false;
+    in property <bool> enabled: true;
+    callback clicked;
+    width: max(42px, compact-label.preferred-width + 20px);
+    height: 28px;
+    border-radius: Theme.radius-sm;
+    border-width: root.checked ? 1px : 0px;
+    border-color: Theme.accent;
+    background: root.checked ? Theme.accent.with-alpha(20%) : compact-touch.has-hover && root.enabled ? Theme.hover : Theme.panel.brighter(15%);
+    opacity: root.enabled ? 1 : 0.45;
+    animate background, border-color, opacity { duration: 150ms; easing: ease-out; }
+    compact-label := Text {
+        text: root.text;
+        color: root.checked ? Theme.accent : Theme.text;
+        font-size: Theme.font-small;
+        font-weight: root.checked ? 600 : 400;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        overflow: elide;
+    }
+    compact-touch := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+export component PopupMenuItem inherits Rectangle {
+    in property <string> glyph;
+    in property <string> label;
+    in property <bool> destructive: false;
+    in property <bool> checked: false;
+    callback clicked;
+    height: 32px;
+    border-radius: Theme.radius-sm;
+    background: item-touch.has-hover ? (root.destructive ? Theme.danger-container : Theme.selection) : transparent;
+    animate background { duration: 120ms; easing: ease-out; }
+    HorizontalLayout {
+        padding-left: Theme.space-sm;
+        padding-right: Theme.space-sm;
+        spacing: Theme.space-sm;
+        cross-axis-alignment: center;
+        MaterialIcon { glyph: root.glyph; color: root.destructive ? Theme.danger : Theme.muted; }
+        Text { text: root.label; color: root.destructive ? Theme.danger : Theme.text; font-size: Theme.font-label; horizontal-stretch: 1; }
+        if root.checked : MaterialIcon { glyph: "check"; color: Theme.accent; }
+    }
+    item-touch := TouchArea { mouse-cursor: pointer; clicked => { root.clicked(); } }
+}
+
+// A row of colour swatches; the first one ("") means "use the theme's colour".
+export component SwatchRow inherits HorizontalLayout {
+    in property <string> selected;
+    in property <color> theme-color;
+    callback picked(string);
+    property <[{ hex: string, fill: color }]> swatches: [
+        { hex: "#8ab4f8", fill: #8ab4f8 },
+        { hex: "#c58af9", fill: #c58af9 },
+        { hex: "#81c995", fill: #81c995 },
+        { hex: "#f28b82", fill: #f28b82 },
+        { hex: "#ff88aa", fill: #ff88aa },
+        { hex: "#d9a648", fill: #d9a648 },
+        { hex: "#9aa0a6", fill: #9aa0a6 },
+    ];
+    spacing: Theme.space-sm;
+    alignment: start;
+    Rectangle {
+        width: 28px;
+        height: 28px;
+        border-radius: 14px;
+        background: root.theme-color;
+        border-width: root.selected == "" ? 2px : 0px;
+        border-color: Theme.text;
+        MaterialIcon { glyph: "palette"; color: Theme.on-accent; font-size: 14px; }
+        TouchArea { mouse-cursor: pointer; clicked => { root.picked(""); } }
+        Tooltip { text: @markdown("Theme default"); }
+    }
+    for swatch in root.swatches : Rectangle {
+        width: 28px;
+        height: 28px;
+        border-radius: 14px;
+        background: swatch.fill;
+        border-width: root.selected == swatch.hex ? 2px : 0px;
+        border-color: Theme.text;
+        TouchArea { mouse-cursor: pointer; clicked => { root.picked(swatch.hex); } }
+    }
+}
+
+// Uppercase section label (Cinny's O400).
+export component SectionLabel inherits Text {
+    color: Theme.muted;
+    font-size: Theme.font-small;
+    font-weight: 700;
+    letter-spacing: 0.5px;
+}
+
+export component Divider inherits Rectangle {
+    height: 1px;
+    background: Theme.border;
+}

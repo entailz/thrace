@@ -8,7 +8,9 @@ Please see LICENSE in the repository root for full details.
 use crate::app::decode::load_all_packs;
 use crate::app::sync::sync_filter;
 use crate::app::text::short_room;
-use crate::app::{LoggedIn, LoginMsg, RoomEntry, RoomInfo, SendResult, ThraceApp};
+use crate::app::{
+    LoggedIn, LoginMsg, RoomEntry, RoomInfo, RoomMeta, RoomNotify, SendResult, ThraceApp,
+};
 
 /// Blocking password login on a worker thread; saves the session for cached restore.
 /// Fresh logins mint a new device id, so the sqlite crypto store must be fresh too.
@@ -83,11 +85,19 @@ pub(in crate::app) async fn collect_logged_in(
             };
             let is_dm = room.is_direct().await.unwrap_or_else(|_| room.is_dm());
             let avatar_mxc = room.avatar_url().map(|u| u.to_string());
+            let last_activity = room
+                .latest_event_timestamp()
+                .map(|ts| u64::from(ts.get()))
+                .unwrap_or_default();
             Some(RoomInfo {
                 room_id,
                 name,
                 is_dm,
                 avatar_mxc,
+                meta: room_meta(&room),
+                last_activity,
+                fully_read: fully_read_marker(&room).await,
+                notify: room.notification_mode().await.map(RoomNotify::from_sdk),
             })
         });
     }
@@ -106,6 +116,25 @@ pub(in crate::app) async fn collect_logged_in(
         session_metadata: None,
         persistence_warning: None,
     })
+}
+
+/// Topic and tags from the SDK's synced room state.
+pub(in crate::app) fn room_meta(room: &matrix_sdk::Room) -> RoomMeta {
+    RoomMeta {
+        favourite: room.is_favourite(),
+        low_priority: room.is_low_priority(),
+        topic: room.topic().filter(|topic| !topic.trim().is_empty()),
+    }
+}
+
+/// The room's `m.fully_read` event, if the account has one stored.
+pub(in crate::app) async fn fully_read_marker(room: &matrix_sdk::Room) -> Option<String> {
+    use matrix_sdk::ruma::events::fully_read::FullyReadEventContent;
+    let raw = room
+        .account_data_static::<FullyReadEventContent>()
+        .await
+        .ok()??;
+    Some(raw.deserialize().ok()?.content.event_id.to_string())
 }
 
 /// Non-secret login metadata. Tokens live in Secret Service; the store directory
@@ -551,6 +580,10 @@ impl ThraceApp {
                 is_dm: r.is_dm,
                 avatar_mxc: r.avatar_mxc.clone(),
                 preview: None,
+                meta: r.meta.clone(),
+                last_activity: r.last_activity,
+                fully_read: r.fully_read.clone(),
+                notify: r.notify,
             })
             .collect();
         rooms.sort_by(|a, b| {
@@ -561,6 +594,8 @@ impl ThraceApp {
         if rooms.is_empty() {
             self.status = "no rooms yet — join one with /join #alias:hs".into();
         }
+        // Unread counts start at zero, so the first room opens without a "New messages" line.
+        self.unread_marker = None;
         self.rooms = rooms;
         self.current = 0;
         self.timelines.clear();
@@ -583,6 +618,14 @@ impl ThraceApp {
             }
         }
         self.client = Some(logged.client);
+        // Start the visible room immediately. Frontends without egui repaint
+        // callbacks (the Slint bridge) must not depend on a later frame to
+        // begin initial history after a logout/login cycle.
+        if let Some(room_id) = self.current_room_id() {
+            self.history_queue.select(&room_id);
+        }
+        self.pump_history();
+        self.refresh_devices();
         // Fresh login: reset watcher + de-dupe set.
         self.verify_watch_running = false;
         self.watch_rx = None;

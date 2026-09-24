@@ -5,7 +5,7 @@ Please see LICENSE in the repository root for full details.
 
 //! Formatting and parsing helpers shared across the app.
 
-use crate::app::Member;
+use crate::app::{Member, TimelineRow};
 use crate::matrix::PackStore;
 
 /// Extract the mxid from a user link: matrix.to pill (often percent-encoded)
@@ -57,8 +57,13 @@ pub(in crate::app) fn now_millis() -> Option<u64> {
         .map(|d| d.as_millis() as u64)
 }
 
-/// Format `origin_server_ts` as a local stamp: `HH:MM` today, dated otherwise.
+/// Format `origin_server_ts` as a local 24-hour stamp: `HH:MM` today, dated otherwise.
 pub(in crate::app) fn format_ts(millis: Option<u64>) -> String {
+    format_ts_clock(millis, false)
+}
+
+/// Like [`format_ts`], with a 12-hour clock (`1:05 PM`) when `twelve_hour` is set.
+pub(in crate::app) fn format_ts_clock(millis: Option<u64>, twelve_hour: bool) -> String {
     use chrono::{Datelike, Local, TimeZone};
     let Some(ms) = millis else {
         return String::new();
@@ -67,13 +72,57 @@ pub(in crate::app) fn format_ts(millis: Option<u64>) -> String {
         return String::new();
     };
     let now = Local::now();
+    let time = if twelve_hour { "%-I:%M %p" } else { "%H:%M" };
     if dt.date_naive() == now.date_naive() {
-        dt.format("%H:%M").to_string()
+        dt.format(time).to_string()
     } else if dt.year() == now.year() {
-        dt.format("%d %b %H:%M").to_string()
+        dt.format(&format!("%d %b {time}")).to_string()
     } else {
-        dt.format("%d %b %Y %H:%M").to_string()
+        dt.format(&format!("%d %b %Y {time}")).to_string()
     }
+}
+
+/// Gap after which a sender's next message starts a new group (Cinny uses the same).
+const GROUP_GAP_MS: u64 = 2 * 60 * 1000;
+
+/// Local calendar day of `origin_server_ts`; `None` for local echoes, which have no stamp yet.
+pub(in crate::app) fn local_day(millis: u64) -> Option<chrono::NaiveDate> {
+    use chrono::{Local, TimeZone};
+    if millis == 0 {
+        return None;
+    }
+    Local
+        .timestamp_millis_opt(millis as i64)
+        .single()
+        .map(|dt| dt.date_naive())
+}
+
+/// Day-divider label: "Today", "Yesterday", or the date. Only the Slint timeline draws dividers.
+#[cfg(feature = "slint-ui")]
+pub(in crate::app) fn day_label(day: chrono::NaiveDate, today: chrono::NaiveDate) -> String {
+    use chrono::Datelike;
+    if day == today {
+        "Today".into()
+    } else if today.pred_opt() == Some(day) {
+        "Yesterday".into()
+    } else if day.year() == today.year() {
+        day.format("%A, %d %B").to_string()
+    } else {
+        day.format("%d %B %Y").to_string()
+    }
+}
+
+/// Whether `row` continues the group `prev` belongs to: same sender, same local day, and less
+/// than two minutes apart. Unstamped local echoes stay with their sender's group.
+pub(in crate::app) fn continues_group(prev: &TimelineRow, row: &TimelineRow) -> bool {
+    if row.sender == "system" || prev.sender != row.sender {
+        return false;
+    }
+    if prev.origin_server_ts == 0 || row.origin_server_ts == 0 {
+        return true;
+    }
+    row.origin_server_ts.saturating_sub(prev.origin_server_ts) < GROUP_GAP_MS
+        && local_day(prev.origin_server_ts) == local_day(row.origin_server_ts)
 }
 
 /// The `@word` at the end of `input`. Only the final word counts, so a

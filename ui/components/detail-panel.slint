@@ -1,0 +1,202 @@
+import { ListView, LineEdit } from "std-widgets.slint";
+import { Theme } from "../theme.slint";
+import { MemberView, PinView } from "../types.slint";
+import { Avatar, IconButton, MaterialIcon, Divider, SectionLabel } from "primitives.slint";
+
+component PinCard inherits Rectangle {
+    in property <PinView> pin;
+    callback clicked;
+    height: pin-layout.preferred-height;
+    background: pin-touch.has-hover ? Theme.selection : Theme.bg;
+    border-radius: Theme.radius-sm;
+    animate background { duration: 140ms; }
+    pin-layout := VerticalLayout {
+        padding: Theme.space-md;
+        spacing: Theme.space-xs;
+        HorizontalLayout {
+            spacing: Theme.space-sm;
+            cross-axis-alignment: center;
+            Avatar { size: 28px; source: root.pin.avatar; has-image: root.pin.has-avatar; initial: root.pin.initial; }
+            VerticalLayout {
+                alignment: center;
+                Text { text: root.pin.sender; color: Theme.accent; font-size: Theme.font-label; font-weight: 700; overflow: elide; }
+                Text { text: root.pin.time; color: Theme.muted; font-size: Theme.font-small; }
+            }
+        }
+        if root.pin.has-media : Rectangle {
+            height: 148px;
+            border-radius: Theme.radius-xs;
+            clip: true;
+            background: Theme.panel;
+            Image { width: parent.width; height: parent.height; source: root.pin.media; image-fit: contain; }
+            if root.pin.media-kind == "video" : Rectangle {
+                width: 38px;
+                height: 38px;
+                border-radius: 19px;
+                background: #00000099;
+                MaterialIcon { width: parent.width; height: parent.height; glyph: "play_arrow"; color: white; }
+            }
+        }
+        if root.pin.media-kind == "audio" : HorizontalLayout {
+            spacing: Theme.space-sm;
+            cross-axis-alignment: center;
+            MaterialIcon { glyph: "music_note"; color: Theme.accent; }
+            Text { text: root.pin.media-label == "" ? "Audio message" : root.pin.media-label; color: Theme.text; font-size: Theme.font-small; overflow: elide; }
+        }
+        // Measured at its own width, like message text; see TextBlock in timeline.slint.
+        if root.pin.body != "" : Rectangle {
+            height: pin-body.preferred-height;
+            pin-body := Text { width: parent.width; text: root.pin.body; color: Theme.text; font-size: Theme.font-label; wrap: word-wrap; }
+        }
+    }
+    pin-touch := TouchArea { mouse-cursor: pointer; clicked => { root.clicked(); } }
+}
+
+// Right-hand panel listing either room members or pinned messages.
+export component DetailPanel inherits Rectangle {
+    in property <bool> show-pins: false;
+    in property <[PinView]> pins;
+    in property <bool> pins-loading: false;
+    in property <string> pins-error;
+    in property <[MemberView]> members;
+    in property <int> member-total: 0;
+    in-out property <string> member-query;
+    in-out property <length> panel-width: 266px;
+    callback close;
+    callback open-pin(string);
+    // Absolute window position of the clicked row, for the profile card.
+    callback member-clicked(MemberView, length, length);
+
+    background: Theme.panel;
+
+    VerticalLayout {
+        HorizontalLayout {
+            height: Theme.header-height;
+            padding-left: Theme.space-md;
+            padding-right: Theme.space-sm;
+            cross-axis-alignment: center;
+            Text {
+                text: root.show-pins ? "Pinned messages" : root.member-total > 0 ? root.member-total + " Members" : "Members";
+                color: Theme.text;
+                font-size: Theme.font-title;
+                font-weight: 600;
+                horizontal-stretch: 1;
+                overflow: elide;
+            }
+            IconButton { glyph: "close"; tooltip: "Close panel"; clicked => { root.close(); } }
+        }
+        Divider { }
+
+        if root.show-pins : VerticalLayout {
+            padding: Theme.space-sm;
+            spacing: Theme.space-sm;
+            if root.pins-loading : HorizontalLayout {
+                height: 46px;
+                spacing: Theme.space-sm;
+                alignment: center;
+                cross-axis-alignment: center;
+                MaterialIcon { glyph: "progress_activity"; }
+                Text { text: "Loading pinned messages…"; color: Theme.muted; font-size: Theme.font-small; }
+            }
+            if !root.pins-loading && root.pins-error != "" : Rectangle {
+                height: error-text.preferred-height + 2 * Theme.space-md;
+                background: Theme.danger-container;
+                border-radius: Theme.radius-sm;
+                error-text := Text {
+                    x: Theme.space-md;
+                    width: parent.width - 2 * Theme.space-md;
+                    text: root.pins-error;
+                    color: Theme.on-danger-container;
+                    font-size: Theme.font-small;
+                    wrap: word-wrap;
+                }
+            }
+            if !root.pins-loading && root.pins-error == "" && root.pins.length == 0 : Text {
+                text: "No pinned messages in this room.";
+                color: Theme.muted;
+                font-size: Theme.font-small;
+                horizontal-alignment: center;
+            }
+            ListView {
+                for pin in root.pins : VerticalLayout {
+                    padding-bottom: Theme.space-sm;
+                    PinCard { pin: pin; clicked => { root.open-pin(pin.id); } }
+                }
+            }
+        }
+
+        if !root.show-pins : VerticalLayout {
+            padding: Theme.space-sm;
+            spacing: Theme.space-xs;
+            LineEdit { text <=> root.member-query; placeholder-text: "Search members"; }
+            if root.members.length == 0 : Text {
+                text: root.member-query == "" ? "No members loaded" : "No matching members";
+                color: Theme.muted;
+                font-size: Theme.font-small;
+                horizontal-alignment: center;
+            }
+            ListView {
+                for member in root.members : VerticalLayout {
+                if member.group-start : SectionLabel {
+                    text: member.group.to-uppercase();
+                    height: 28px;
+                    vertical-alignment: bottom;
+                }
+                Rectangle {
+                    height: 40px;
+                    border-radius: Theme.radius-sm;
+                    background: member-touch.has-hover ? Theme.hover : transparent;
+                    HorizontalLayout {
+                        padding-left: Theme.space-sm;
+                        padding-right: Theme.space-sm;
+                        spacing: Theme.space-sm;
+                        cross-axis-alignment: center;
+                        Rectangle {
+                            width: 28px;
+                            height: 28px;
+                            Avatar { size: 28px; source: member.avatar; has-image: member.has-avatar; initial: member.initial; }
+                            // Only when the server reports presence; many homeservers disable it.
+                            if member.presence != "" : Rectangle {
+                                x: parent.width - self.width + 1px;
+                                y: parent.height - self.height + 1px;
+                                width: 10px;
+                                height: 10px;
+                                border-radius: 5px;
+                                background: member.presence == "online" ? Theme.success : member.presence == "unavailable" ? Theme.warning : Theme.muted;
+                                border-color: Theme.panel;
+                                border-width: 2px;
+                            }
+                        }
+                        Text {
+                            text: member.name;
+                            color: member.presence == "" || member.presence == "online" ? Theme.text : Theme.muted;
+                            font-size: Theme.font-label + 1px;
+                            overflow: elide;
+                            horizontal-stretch: 1;
+                        }
+                    }
+                    member-touch := TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => { root.member-clicked(member, self.absolute-position.x, self.absolute-position.y); }
+                    }
+                }
+                }
+            }
+        }
+    }
+
+    // Drag handle on the left edge to resize the panel.
+    Rectangle {
+        x: 0;
+        width: 4px;
+        background: resize-area.has-hover || resize-area.pressed ? Theme.accent : transparent;
+        resize-area := TouchArea {
+            mouse-cursor: ew-resize;
+            moved => {
+                if (self.pressed) {
+                    root.panel-width = max(200px, min(420px, root.panel-width - (self.mouse-x - self.pressed-x)));
+                }
+            }
+        }
+    }
+}

@@ -19,6 +19,8 @@ mod prefs;
 mod rows;
 mod send;
 mod session;
+#[cfg(feature = "slint-ui")]
+pub mod slint_bridge;
 mod sync;
 mod text;
 mod view;
@@ -259,8 +261,13 @@ pub struct ThraceApp {
     pinned_loading: bool,
     pinned_error: Option<String>,
     pinned_rx: Option<std::sync::mpsc::Receiver<(String, Result<Vec<PinnedMessage>, String>)>>,
-    /// Rooms we have tagged as favourites, for the menu's toggle state.
-    favourites: std::collections::HashSet<String>,
+    /// Users typing per room, own account excluded.
+    typing: std::collections::HashMap<String, Vec<String>>,
+    /// Last known presence per user; users missing here have presence disabled or unknown.
+    presence: std::collections::HashMap<String, String>,
+    /// Where the current room's "New messages" line goes: the `m.fully_read` event as it
+    /// was when the room was opened, so the line stays put while reading.
+    unread_marker: Option<String>,
     /// Profile card: (mxid, anchor). Opened by clicking an avatar or name in
     /// the timeline or the member list.
     profile_target: Option<(String, egui::Pos2, u64)>,
@@ -336,6 +343,16 @@ pub struct ThraceApp {
     settings_font_size: f32,
     /// Show newest message under each room name.
     show_previews: bool,
+    /// Timeline style for the Slint UI ("bubble", "modern" or "compact").
+    message_layout: String,
+    /// Clock for message times in the Slint UI ("24h" or "12h").
+    time_format: String,
+    /// Slint sidebar order ("activity", "unread" or "name") and whether it is split into sections.
+    room_sort: String,
+    group_rooms: bool,
+    /// Slint bubble colours ("#rrggbb", or empty for the theme's).
+    own_bubble_color: String,
+    other_bubble_color: String,
     /// Room sidebar (rooms + DMs) hidden; the toggle lives in the titlebar.
     sidebar_collapsed: bool,
     // Runtime.
@@ -354,12 +371,20 @@ pub(in crate::app) struct SyncBatch {
     rows: Vec<(String, TimelineRow)>,
     reactions: Vec<(String, SyncReaction)>,
     verify_flows: Vec<crate::verify::IncomingRequest>,
-    /// (room, event, user) read receipts.
-    receipts: Vec<(String, String, String)>,
+    /// (room, event, user, ts) read receipts; `ts` is 0 when the receipt has none.
+    receipts: Vec<(String, String, String, u64)>,
     /// (room, target, body, formatted) `m.replace` edits.
     edits: Vec<(String, String, String, Option<String>)>,
     /// (room, redacted event) `m.room.redaction`s.
     redactions: Vec<(String, String)>,
+    /// Current topic and tags of every room in the sync response.
+    room_meta: Vec<(String, RoomMeta)>,
+    /// (room, users) from `m.typing`; an empty list means nobody is typing.
+    typing: Vec<(String, Vec<String>)>,
+    /// (room, event) `m.fully_read` marker moves.
+    fully_read: Vec<(String, String)>,
+    /// (user, state) presence updates: "online", "unavailable" or "offline".
+    presence: Vec<(String, String)>,
 }
 
 impl SyncBatch {
@@ -372,6 +397,10 @@ impl SyncBatch {
             && self.receipts.is_empty()
             && self.redactions.is_empty()
             && self.edits.is_empty()
+            && self.room_meta.is_empty()
+            && self.typing.is_empty()
+            && self.fully_read.is_empty()
+            && self.presence.is_empty()
     }
 }
 
@@ -433,7 +462,7 @@ pub(in crate::app) const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/help", "list these commands"),
 ];
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub(in crate::app) struct RoomEntry {
     room_id: String,
     name: String,
@@ -444,6 +473,22 @@ pub(in crate::app) struct RoomEntry {
     avatar_mxc: Option<String>,
     /// Newest "sender: text" preview.
     preview: Option<String>,
+    /// Room tags (`m.favourite`, `m.lowpriority`), kept in sync with the server.
+    meta: RoomMeta,
+    /// `origin_server_ts` of the newest message, for sorting by activity.
+    last_activity: u64,
+    /// Event our `m.fully_read` marker points at.
+    fully_read: Option<String>,
+    /// Effective notification mode (the account default when the room has no rule).
+    notify: Option<RoomNotify>,
+}
+
+/// Room details the SDK keeps up to date from state and account data.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(in crate::app) struct RoomMeta {
+    favourite: bool,
+    low_priority: bool,
+    topic: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -452,14 +497,23 @@ pub(in crate::app) struct RoomInfo {
     name: String,
     is_dm: bool,
     avatar_mxc: Option<String>,
+    meta: RoomMeta,
+    last_activity: u64,
+    fully_read: Option<String>,
+    notify: Option<RoomNotify>,
 }
 
 #[derive(Debug, Clone)]
 pub(in crate::app) struct Member {
     display: String,
     mxid: String,
-    online: bool,
     avatar_mxc: Option<String>,
+    /// Room power level; room creators (v12+) count as `i64::MAX`. Only the Slint member
+    /// list groups by it.
+    #[cfg_attr(not(feature = "slint-ui"), allow(dead_code))]
+    power: i64,
+    /// Stored presence ("online", "unavailable", "offline"); `None` when the server sends none.
+    presence: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -598,7 +652,7 @@ pub(in crate::app) enum RoomMenuAction {
 }
 
 /// Per-room notification mode.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::app) enum RoomNotify {
     All,
     MentionsOnly,
@@ -611,6 +665,17 @@ impl RoomNotify {
             RoomNotify::All => "All messages",
             RoomNotify::MentionsOnly => "Mentions only",
             RoomNotify::Mute => "Mute",
+        }
+    }
+
+    pub(in crate::app) fn from_sdk(
+        mode: matrix_sdk::notification_settings::RoomNotificationMode,
+    ) -> Self {
+        use matrix_sdk::notification_settings::RoomNotificationMode;
+        match mode {
+            RoomNotificationMode::AllMessages => RoomNotify::All,
+            RoomNotificationMode::MentionsAndKeywordsOnly => RoomNotify::MentionsOnly,
+            RoomNotificationMode::Mute => RoomNotify::Mute,
         }
     }
 
@@ -675,6 +740,14 @@ impl ThraceApp {
         config_file: crate::config::ConfigFile,
         cli_theme: Option<String>,
     ) -> Self {
+        Self::new_with_context(cc.egui_ctx.clone(), config_file, cli_theme)
+    }
+
+    pub fn new_with_context(
+        ctx: egui::Context,
+        config_file: crate::config::ConfigFile,
+        cli_theme: Option<String>,
+    ) -> Self {
         let config = config_file.saved.clone();
         let theme_name = cli_theme.unwrap_or_else(|| config.theme.clone());
         let mut theme = ThemeFile::load_builtin(&theme_name).unwrap_or_else(|_| ThemeFile {
@@ -685,7 +758,7 @@ impl ThraceApp {
             font: Default::default(),
         });
         theme.font.mono_size = Some(config.font_size);
-        theme::apply_theme(&cc.egui_ctx, &theme);
+        theme::apply_theme(&ctx, &theme);
 
         let packs = PackStore::new();
 
@@ -700,7 +773,7 @@ impl ThraceApp {
 
         Self {
             rt: Arc::new(rt),
-            ctx: cc.egui_ctx.clone(),
+            ctx,
             drop_hint: "drag files here to attach".into(),
             theme,
             rooms: Vec::new(),
@@ -757,7 +830,9 @@ impl ThraceApp {
             pinned_loading: false,
             pinned_error: None,
             pinned_rx: None,
-            favourites: std::collections::HashSet::new(),
+            typing: std::collections::HashMap::new(),
+            presence: std::collections::HashMap::new(),
+            unread_marker: None,
             send_rx: None,
             send_tx: None,
             dm_rx: None,
@@ -822,6 +897,12 @@ impl ThraceApp {
             ignored_rx: None,
             settings_font_size: config.font_size,
             show_previews: config.show_previews,
+            message_layout: config.message_layout.clone(),
+            time_format: config.time_format.clone(),
+            room_sort: config.room_sort.clone(),
+            group_rooms: config.group_rooms,
+            own_bubble_color: config.own_bubble_color.clone(),
+            other_bubble_color: config.other_bubble_color.clone(),
             sidebar_collapsed: false,
         }
     }
@@ -845,9 +926,19 @@ impl ThraceApp {
     }
 
     /// Known user info without a round trip.
+    /// Presence for `member`: live sync first, then what the store held when members loaded.
+    /// `None` when the server reports no presence (many homeservers disable it).
+    pub(in crate::app) fn presence_of<'a>(&'a self, member: &'a Member) -> Option<&'a str> {
+        self.presence
+            .get(&member.mxid)
+            .or(member.presence.as_ref())
+            .map(String::as_str)
+    }
+
     pub(in crate::app) fn profile_of(&self, mxid: &str) -> (String, Option<String>, bool) {
         if let Some(m) = self.members.iter().find(|m| m.mxid == mxid) {
-            return (m.display.clone(), m.avatar_mxc.clone(), m.online);
+            let online = self.presence_of(m).is_none_or(|state| state == "online");
+            return (m.display.clone(), m.avatar_mxc.clone(), online);
         }
         // Absent from member list: fall back to their latest message.
         let avatar = self

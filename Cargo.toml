@@ -9,9 +9,18 @@ license = "AGPL-3.0-only"
 name = "thrace"
 path = "src/main.rs"
 
+[[bin]]
+name = "thrace-slint"
+path = "src/slint_main.rs"
+required-features = ["slint-ui"]
+
+[features]
+slint-ui = ["dep:slint"]
+
 [dependencies]
 eframe = { version = "0.35", features = ["default"] }
 egui = "0.35"
+slint = { version = "=1.18.1", optional = true }
 tokio = { version = "1", features = ["full"] }
 tokio-sync = "0.1"
 futures-core = "0.3"
@@ -21,6 +30,7 @@ serde_json = "1"
 toml = "0.8"
 matrix-sdk = { version = "0.18", features = ["sqlite", "e2e-encryption", "sso-login"] }
 url = "2"
+webbrowser = "1.2"
 rfd = "0.15"
 mime = "0.3"
 mime_guess = "2"
@@ -35,6 +45,9 @@ tiny-skia = "0.11"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 arboard = { version = "3.6", features = ["image-data", "wayland-data-control"] }
 secret-service = { version = "5.2.0", features = ["rt-tokio-crypto-rust"] }
+
+[build-dependencies]
+slint-build = "=1.18.1"
 
 [profile.release]
 opt-level = 2

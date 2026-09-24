@@ -1168,6 +1168,11 @@ impl ThraceApp {
                 std::rc::Rc::make_mut(&mut self.rows).clear();
                 self.members.clear();
             }
+            RoomMenuAction::Notify(mode) => {
+                if let Some(r) = self.rooms.iter_mut().find(|r| r.room_id == room_id) {
+                    r.notify = Some(mode);
+                }
+            }
             _ => {}
         }
 
